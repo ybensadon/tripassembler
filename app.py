@@ -82,24 +82,41 @@ async def assemble(request: str = Form(...)):
     slug_base = "".join(c if c.isalnum() or c == "-" else "" for c in slug_base)
     slug = f"{slug_base}-{datetime.now().strftime('%Y%m%d%H%M')}"
 
-    prompt = f"""You are a helpful travel planner. Create a practical trip assembly based on this request:
+    prompt = f"""You are an expert travel planner. Create a practical, realistic trip assembly based on this request:
 
 "{request}"
 
-Return ONLY valid JSON with this exact structure:
+Rules:
+- Use real or realistic hotel/apartment names and neighborhoods when possible
+- Give approximate price ranges that make sense for the destination and group size
+- Create a multi-day itinerary (match the number of days/nights in the request if given)
+- Include specific attractions, food ideas, and practical tips
+- Keep everything concise but useful
+- Return ONLY valid JSON with this exact structure:
+
 {{
-  "title": "short descriptive title",
-  "location": "main destination",
-  "summary": "2-3 sentence summary",
-  "constraints": ["list", "of", "key", "constraints"],
+  "title": "clear, appealing title",
+  "location": "main city or region",
+  "summary": "2-4 sentence overview of the trip",
+  "constraints": ["key constraint 1", "key constraint 2", "key constraint 3"],
   "hotels": [
-    {{"name": "hotel or apartment name", "why": "why it fits", "price_range": "$X-Y", "area": "neighborhood"}}
+    {{
+      "name": "realistic place name",
+      "why": "why it fits the request",
+      "price_range": "$XXX-YYY per night",
+      "area": "neighborhood or area"
+    }}
   ],
   "itinerary": [
-    {{"day": 1, "title": "day title", "activities": ["activity1", "activity2"], "tips": "short tip"}}
+    {{
+      "day": 1,
+      "title": "day theme",
+      "activities": ["specific activity 1", "specific activity 2", "specific activity 3"],
+      "tips": "one practical tip"
+    }}
   ],
-  "transport": "how to get around",
-  "budget_notes": "budget guidance"
+  "transport": "how to get around (with any important notes)",
+  "budget_notes": "realistic budget guidance based on the request"
 }}"""
 
     try:
