@@ -67,67 +67,92 @@ async def home():
     </body></html>
     """
 
+import os
+from openai import OpenAI
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 @app.post("/assemble")
 async def assemble(request: str = Form(...)):
     request = request.strip()
     if not request:
         request = "a trip"
 
-    # Simple extraction of useful bits from the user's text
     slug_base = "-".join(request.lower().split()[:6])
     slug_base = "".join(c if c.isalnum() or c == "-" else "" for c in slug_base)
     slug = f"{slug_base}-{datetime.now().strftime('%Y%m%d%H%M')}"
 
-    assembly = {
-        "slug": slug,
-        "title": f"Trip assembly: {request[:80]}{'...' if len(request) > 80 else ''}",
-        "location": "Based on your request",
-        "summary": f"Here's a practical starting assembly for: “{request}”.",
-        "constraints": [request],  # just show what they typed for now
-        "hotels": [{
-            "name": "Suggested stay (placeholder)",
-            "why": "Matches the general vibe of your request",
-            "price_range": "TBD",
-            "area": "Central area"
-        }],
-        "itinerary": [{
-            "day": 1,
-            "title": "Arrival & Settle In",
-            "activities": ["Check-in", "Explore nearby area", "Easy first meal"],
-            "tips": "Adjust this based on your actual dates and energy level"
-        }],
-        "transport": "Local transit + walking (customize as needed)",
-        "budget_notes": f"Budget guidance will depend on the specifics in your request: {request[:120]}"
-    }
+    prompt = f"""You are a helpful travel planner. Create a practical trip assembly based on this request:
 
+"{request}"
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "title": "short descriptive title",
+  "location": "main destination",
+  "summary": "2-3 sentence summary",
+  "constraints": ["list", "of", "key", "constraints"],
+  "hotels": [
+    {{"name": "hotel or apartment name", "why": "why it fits", "price_range": "$X-Y", "area": "neighborhood"}}
+  ],
+  "itinerary": [
+    {{"day": 1, "title": "day title", "activities": ["activity1", "activity2"], "tips": "short tip"}}
+  ],
+  "transport": "how to get around",
+  "budget_notes": "budget guidance"
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        assembly = json.loads(response.choices[0].message.content)
+        assembly["slug"] = slug
+    except Exception as e:
+        # Fallback if AI fails
+        assembly = {
+            "slug": slug,
+            "title": f"Trip assembly: {request[:80]}",
+            "location": "Based on your request",
+            "summary": f"Could not generate full assembly. Request was: {request}",
+            "constraints": [request],
+            "hotels": [{"name": "Error generating", "why": str(e), "price_range": "—", "area": "—"}],
+            "itinerary": [{"day": 1, "title": "Error", "activities": ["Try again"], "tips": ""}],
+            "transport": "—",
+            "budget_notes": "—"
+        }
+
+    # (rest of the function stays the same: build hotels_html, itinerary_html, write the file, update index, redirect)
     hotels_html = "".join(
         f"<p><strong>{h['name']}</strong> ({h['area']}) — {h['why']} ({h['price_range']})</p>"
-        for h in assembly["hotels"]
+        for h in assembly.get("hotels", [])
     )
     itinerary_html = "".join(
-        f'<div class="day"><h3>Day {d["day"]}: {d["title"]}</h3>'
-        f'<ul>{"".join(f"<li>{a}</li>" for a in d["activities"])}</ul>'
-        f'<p><em>{d["tips"]}</em></p></div>'
-        for d in assembly["itinerary"]
+        f'<div class="day"><h3>Day {d.get("day", "?")}: {d.get("title", "")}</h3>'
+        f'<ul>{"".join(f"<li>{a}</li>" for a in d.get("activities", []))}</ul>'
+        f'<p><em>{d.get("tips", "")}</em></p></div>'
+        for d in assembly.get("itinerary", [])
     )
 
     html = PAGE_TEMPLATE.format(
-        title=assembly["title"],
-        location=assembly["location"],
-        constraints=", ".join(assembly["constraints"]),
-        summary=assembly["summary"],
+        title=assembly.get("title", "Trip"),
+        location=assembly.get("location", ""),
+        constraints=", ".join(assembly.get("constraints", [])),
+        summary=assembly.get("summary", ""),
         hotels_html=hotels_html,
         itinerary_html=itinerary_html,
-        transport=assembly["transport"],
-        budget_notes=assembly["budget_notes"]
+        transport=assembly.get("transport", ""),
+        budget_notes=assembly.get("budget_notes", "")
     )
 
     with open(os.path.join(PAGES_DIR, f"{slug}.html"), "w") as f:
         f.write(html)
 
     index = load_index()
-    index.insert(0, {"slug": slug, "title": assembly["title"]})
+    index.insert(0, {"slug": slug, "title": assembly.get("title", "Trip")})
     save_index(index)
 
     return RedirectResponse(f"/pages/{slug}.html", status_code=303)
-app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
