@@ -156,3 +156,4 @@ Return ONLY valid JSON with this exact structure:
     save_index(index)
 
     return RedirectResponse(f"/pages/{slug}.html", status_code=303)
+app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
