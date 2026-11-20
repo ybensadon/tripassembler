@@ -130,3 +130,4 @@ async def assemble(request: str = Form(...)):
     save_index(index)
 
     return RedirectResponse(f"/pages/{slug}.html", status_code=303)
+app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
