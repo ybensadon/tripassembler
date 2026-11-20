@@ -6,8 +6,8 @@ from datetime import datetime
 from openai import OpenAI
 
 app = FastAPI()
-PAGES_DIR = "pages"
-INDEX_FILE = "index.json"
+PAGES_DIR = "/opt/render/project/src/pages"
+INDEX_FILE = "/opt/render/project/src/index.json"
 os.makedirs(PAGES_DIR, exist_ok=True)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
