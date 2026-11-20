@@ -69,29 +69,59 @@ async def home():
 
 @app.post("/assemble")
 async def assemble(request: str = Form(...)):
+    request = request.strip()
+    if not request:
+        request = "a trip"
+
+    # Simple extraction of useful bits from the user's text
+    slug_base = "-".join(request.lower().split()[:6])
+    slug_base = "".join(c if c.isalnum() or c == "-" else "" for c in slug_base)
+    slug = f"{slug_base}-{datetime.now().strftime('%Y%m%d%H%M')}"
+
     assembly = {
-        "slug": "tokyo-family-kitchen-" + datetime.now().strftime("%Y%m%d%H%M"),
-        "title": "Family-friendly Tokyo stay with kitchen near parks",
-        "location": "Tokyo, Japan",
-        "summary": "A practical assembly based on your request for a family trip with kitchen access and parks.",
-        "constraints": ["family", "kitchen", "parks", "budget-conscious"],
-        "hotels": [{"name": "Apartment in Nakameguro", "why": "Kitchen + parks nearby", "price_range": "$180-240", "area": "Nakameguro"}],
-        "itinerary": [{"day": 1, "title": "Arrival", "activities": ["Check-in", "Local park walk", "Easy dinner"], "tips": "Get a Suica card"}],
-        "transport": "Subway + walking",
-        "budget_notes": "Apartments in this range are realistic outside the very center."
+        "slug": slug,
+        "title": f"Trip assembly: {request[:80]}{'...' if len(request) > 80 else ''}",
+        "location": "Based on your request",
+        "summary": f"Here's a practical starting assembly for: “{request}”.",
+        "constraints": [request],  # just show what they typed for now
+        "hotels": [{
+            "name": "Suggested stay (placeholder)",
+            "why": "Matches the general vibe of your request",
+            "price_range": "TBD",
+            "area": "Central area"
+        }],
+        "itinerary": [{
+            "day": 1,
+            "title": "Arrival & Settle In",
+            "activities": ["Check-in", "Explore nearby area", "Easy first meal"],
+            "tips": "Adjust this based on your actual dates and energy level"
+        }],
+        "transport": "Local transit + walking (customize as needed)",
+        "budget_notes": f"Budget guidance will depend on the specifics in your request: {request[:120]}"
     }
 
-    hotels_html = "".join(f"<p><strong>{h['name']}</strong> ({h['area']}) — {h['why']} ({h['price_range']})</p>" for h in assembly["hotels"])
-    itinerary_html = "".join(f'<div class="day"><h3>Day {d["day"]}: {d["title"]}</h3><ul>{"".join("<li>"+a+"</li>" for a in d["activities"])}</ul><p><em>{d["tips"]}</em></p></div>' for d in assembly["itinerary"])
-
-    html = PAGE_TEMPLATE.format(
-        title=assembly["title"], location=assembly["location"],
-        constraints=", ".join(assembly["constraints"]), summary=assembly["summary"],
-        hotels_html=hotels_html, itinerary_html=itinerary_html,
-        transport=assembly["transport"], budget_notes=assembly["budget_notes"]
+    hotels_html = "".join(
+        f"<p><strong>{h['name']}</strong> ({h['area']}) — {h['why']} ({h['price_range']})</p>"
+        for h in assembly["hotels"]
+    )
+    itinerary_html = "".join(
+        f'<div class="day"><h3>Day {d["day"]}: {d["title"]}</h3>'
+        f'<ul>{"".join(f"<li>{a}</li>" for a in d["activities"])}</ul>'
+        f'<p><em>{d["tips"]}</em></p></div>'
+        for d in assembly["itinerary"]
     )
 
-    slug = assembly["slug"]
+    html = PAGE_TEMPLATE.format(
+        title=assembly["title"],
+        location=assembly["location"],
+        constraints=", ".join(assembly["constraints"]),
+        summary=assembly["summary"],
+        hotels_html=hotels_html,
+        itinerary_html=itinerary_html,
+        transport=assembly["transport"],
+        budget_notes=assembly["budget_notes"]
+    )
+
     with open(os.path.join(PAGES_DIR, f"{slug}.html"), "w") as f:
         f.write(html)
 
@@ -100,5 +130,3 @@ async def assemble(request: str = Form(...)):
     save_index(index)
 
     return RedirectResponse(f"/pages/{slug}.html", status_code=303)
-
-app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
