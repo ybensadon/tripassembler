@@ -196,4 +196,7 @@ async def sitemap():
         xml += f"  <url><loc>{url}</loc></url>\n"
     xml += "</urlset>"
     return HTMLResponse(content=xml, media_type="application/xml")
+    @app.get("/robots.txt")
+async def robots():
+    return HTMLResponse("User-agent: *\nAllow: /\nSitemap: https://tripassembler.onrender.com/sitemap.xml\n", media_type="text/plain")
 app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
