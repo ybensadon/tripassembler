@@ -124,6 +124,7 @@ Guidelines:
 - Build a proper multi-day itinerary matching the requested length
 - Include specific attractions, activities, food ideas, and practical tips
 - Include a "map_places" array with 4–8 key locations in itinerary order (hotels, towns, attractions), formatted as "Name, City or Region"
+- For each hotel and each activity, include a realistic "url" field with a booking or info link when possible (Booking.com, official site, GetYourGuide, etc.)
 - Return ONLY valid JSON in this exact structure:
 
 {{
@@ -132,10 +133,10 @@ Guidelines:
   "summary": "2-4 sentence overview",
   "constraints": ["constraint 1", "constraint 2", "constraint 3"],
   "hotels": [
-    {{"name": "place name", "why": "why it fits", "price_range": "$XXX-YYY per night", "area": "neighborhood"}}
+    {{"name": "place name", "why": "why it fits", "price_range": "$XXX-YYY per night", "area": "neighborhood", "url": "https://example.com"}}
   ],
   "itinerary": [
-    {{"day": 1, "title": "theme", "activities": ["specific thing 1", "specific thing 2"], "tips": "practical tip"}}
+    {{"day": 1, "title": "theme", "activities": ["specific thing 1", "specific thing 2"], "tips": "practical tip", "activity_urls": ["https://example.com", "https://example.com"]}}
   ],
   "map_places": ["Place 1, Region", "Place 2, Region", "Place 3, Region"],
   "transport": "how to get around + any notes",
@@ -185,12 +186,13 @@ Guidelines:
         map_url = f"https://www.google.com/maps/embed/v1/search?key={MAPS_KEY}&q={query}" if MAPS_KEY else "about:blank"
 
     hotels_html = "".join(
-        f"<p><strong>{h.get('name','')}</strong> ({h.get('area','')}) — {h.get('why','')} ({h.get('price_range','')})</p>"
+        f"<p><strong>{h.get('name','')}</strong> ({h.get('area','')}) — {h.get('why','')} ({h.get('price_range','')})"
+        f"{f' <a href=\"{h.get(\"url\")}\" target=\"_blank\">Book / View</a>' if h.get('url') else ''}</p>"
         for h in assembly.get("hotels", [])
     )
     itinerary_html = "".join(
         f'<div class="day"><h3>Day {d.get("day","?")}: {d.get("title","")}</h3>'
-        f'<ul>{"".join(f"<li>{a}</li>" for a in d.get("activities",[]))}</ul>'
+        f'<ul>{"".join(f"<li>{a}</li>" for a in d.get("activities", []))}</ul>'
         f'<p><em>{d.get("tips","")}</em></p></div>'
         for d in assembly.get("itinerary", [])
     )
