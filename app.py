@@ -11,6 +11,7 @@ INDEX_FILE = "/opt/render/project/src/index.json"
 os.makedirs(PAGES_DIR, exist_ok=True)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MAPS_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
 def load_index():
     if os.path.exists(INDEX_FILE):
@@ -36,13 +37,15 @@ PAGE_TEMPLATE = """
 <style>
   body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 40px auto; line-height: 1.65; padding: 0 20px; color: #111; }}
   h1 {{ color: #004E89; font-size: 2rem; margin-bottom: 0.4em; }}
-  .meta {{ color: #555; margin-bottom: 1.5em; }}
-  .constraints {{ background: #f0f4f8; padding: 16px 18px; border-radius: 10px; margin: 1.5em 0; }}
+  .meta {{ color: #555; margin-bottom: 1em; }}
+  .constraints {{ background: #f0f4f8; padding: 16px 18px; border-radius: 10px; margin: 1.2em 0; }}
+  .map-container {{ margin: 1.5em 0 2em 0; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }}
+  iframe {{ width: 100%; height: 420px; border: 0; }}
   .day {{ background: #fff; border: 1px solid #e5e7eb; padding: 18px; margin: 16px 0; border-radius: 10px; }}
   .actions {{ margin: 2.5em 0; display: flex; gap: 10px; flex-wrap: wrap; }}
   .btn {{ padding: 10px 16px; border-radius: 8px; border: 1px solid #ddd; background: #fff; text-decoration: none; color: #333; font-size: 0.95em; }}
   .btn:hover {{ background: #f9fafb; }}
-  @media print {{ .actions {{ display: none; }} }}
+  @media print {{ .actions, .map-container {{ display: none; }} }}
 </style>
 </head>
 <body>
@@ -50,6 +53,10 @@ PAGE_TEMPLATE = """
 <div class="meta"><strong>Location:</strong> {location}</div>
 <div class="constraints"><strong>Key constraints:</strong> {constraints}</div>
 <p>{summary}</p>
+
+<div class="map-container">
+  <iframe src="{map_url}" allowfullscreen loading="lazy"></iframe>
+</div>
 
 <h2>Recommended Stays</h2>
 {hotels_html}
@@ -113,10 +120,10 @@ async def assemble(request: str = Form(...)):
 
 Guidelines:
 - Prefer real or highly realistic hotel/apartment names and neighborhoods
-- Give believable price ranges for the destination, season, and group size
-- Build a proper multi-day itinerary that matches the requested length
-- Include specific attractions, short activity ideas, food suggestions, and practical tips
-- Be concrete and actionable
+- Give believable price ranges
+- Build a proper multi-day itinerary matching the requested length
+- Include specific attractions, activities, food ideas, and practical tips
+- Include a "map_places" array with 4–8 key locations in itinerary order (hotels, towns, attractions), formatted as "Name, City or Region"
 - Return ONLY valid JSON in this exact structure:
 
 {{
@@ -130,6 +137,7 @@ Guidelines:
   "itinerary": [
     {{"day": 1, "title": "theme", "activities": ["specific thing 1", "specific thing 2"], "tips": "practical tip"}}
   ],
+  "map_places": ["Place 1, Region", "Place 2, Region", "Place 3, Region"],
   "transport": "how to get around + any notes",
   "budget_notes": "realistic budget guidance"
 }}"""
@@ -152,9 +160,23 @@ Guidelines:
             "constraints": [request],
             "hotels": [{"name": "Error", "why": "AI call failed", "price_range": "—", "area": "—"}],
             "itinerary": [{"day": 1, "title": "Error", "activities": ["Try again"], "tips": ""}],
+            "map_places": [],
             "transport": "—",
             "budget_notes": "—"
         }
+
+    # Build Google Maps embed URL
+    places = assembly.get("map_places", [])
+    if MAPS_KEY and places and len(places) >= 2:
+        origin = places[0].replace(" ", "+")
+        destination = places[-1].replace(" ", "+")
+        waypoints = "|".join(p.replace(" ", "+") for p in places[1:-1])
+        map_url = f"https://www.google.com/maps/embed/v1/directions?key={MAPS_KEY}&origin={origin}&destination={destination}"
+        if waypoints:
+            map_url += f"&waypoints={waypoints}"
+    else:
+        query = (assembly.get("location") or "travel").replace(" ", "+")
+        map_url = f"https://www.google.com/maps/embed/v1/search?key={MAPS_KEY}&q={query}" if MAPS_KEY else ""
 
     hotels_html = "".join(
         f"<p><strong>{h.get('name','')}</strong> ({h.get('area','')}) — {h.get('why','')} ({h.get('price_range','')})</p>"
@@ -172,6 +194,7 @@ Guidelines:
         location=assembly.get("location", ""),
         constraints=", ".join(assembly.get("constraints", [])),
         summary=assembly.get("summary", ""),
+        map_url=map_url,
         hotels_html=hotels_html,
         itinerary_html=itinerary_html,
         transport=assembly.get("transport", ""),
@@ -186,17 +209,21 @@ Guidelines:
     save_index(index)
 
     return RedirectResponse(f"/pages/{slug}.html", status_code=303)
+
+# Sitemap + robots
 @app.get("/sitemap.xml")
 async def sitemap():
     index = load_index()
-    base = "https://tripassembler.onrender.com"  # change if you use a custom domain later
+    base = "https://tripassembler.onrender.com"
     urls = [f"{base}/"] + [f"{base}/pages/{item['slug']}.html" for item in index]
     xml = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
     for url in urls:
         xml += f"  <url><loc>{url}</loc></url>\n"
     xml += "</urlset>"
     return HTMLResponse(content=xml, media_type="application/xml")
-    @app.get("/robots.txt")
+
+@app.get("/robots.txt")
 async def robots():
     return HTMLResponse("User-agent: *\nAllow: /\nSitemap: https://tripassembler.onrender.com/sitemap.xml\n", media_type="text/plain")
+
 app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
