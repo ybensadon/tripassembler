@@ -187,7 +187,8 @@ Guidelines:
 
     hotels_html = "".join(
         f"<p><strong>{h.get('name','')}</strong> ({h.get('area','')}) — {h.get('why','')} ({h.get('price_range','')})"
-        f"{f' <a href=\"{h.get(\"url\")}\" target=\"_blank\">Book / View</a>' if h.get('url') else ''}</p>"
+        + (f' <a href="{h.get("url")}" target="_blank">Book / View</a>' if h.get('url') else '')
+        + "</p>"
         for h in assembly.get("hotels", [])
     )
     itinerary_html = "".join(
