@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.middleware.gzip import GZipMiddleware
 import html
 import json
@@ -12,6 +11,12 @@ from openai import OpenAI
 
 app = FastAPI()
 app.add_middleware(GZipMiddleware, minimum_size=500)
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(ROOT_DIR, "static")
+LEGACY_DIR = os.path.join(ROOT_DIR, "legacy_pages")
+STYLES_PATH = os.path.join(STATIC_DIR, "styles.css")
+HOME_TEMPLATE = os.path.join(STATIC_DIR, "home.html")
 
 PAGES_DIR = "/opt/render/project/src/pages"
 INDEX_FILE = "/opt/render/project/src/index.json"
@@ -56,6 +61,63 @@ def slugify(text, max_len=70):
     text = (text or "").lower()
     text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
     return text[:max_len].strip("-") or "trip"
+
+
+def compose_request(where="", budget="", who="", must="", when="", request=""):
+    """Combine the home page's five fields into the planner request text."""
+    labeled = [
+        ("Where do you want to go?", where),
+        ("Budget", budget),
+        ("Who's coming and space needed", who),
+        ("Must-haves and vibe", must),
+        ("Timing and other notes", when),
+    ]
+    lines = []
+    for label, value in labeled:
+        text = str(value or "").strip()
+        if text:
+            lines.append(f"{label}: {text}")
+    extra = str(request or "").strip()
+    if extra:
+        lines.append(extra)
+    return "\n".join(lines) if lines else "a trip"
+
+
+_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,180}")
+
+
+def _inside(path, directory):
+    real = os.path.realpath(path)
+    root = os.path.realpath(directory)
+    return real == root or real.startswith(root + os.sep)
+
+
+def legacy_slugs():
+    if not os.path.isdir(LEGACY_DIR):
+        return []
+    slugs = []
+    for name in os.listdir(LEGACY_DIR):
+        if not name.endswith(".html"):
+            continue
+        slug = name[:-5]
+        if _SLUG_RE.fullmatch(slug):
+            slugs.append(slug)
+    slugs.sort()
+    return slugs
+
+
+def resolve_page_file(raw):
+    """Generated page on the persistent disk, then a legacy page, else nothing."""
+    name = raw[:-5] if raw.endswith(".html") else raw
+    if not _SLUG_RE.fullmatch(name):
+        return None
+    generated = os.path.join(PAGES_DIR, name + ".html")
+    legacy = os.path.join(LEGACY_DIR, name + ".html")
+    if os.path.isfile(generated) and _inside(generated, PAGES_DIR):
+        return generated
+    if os.path.isfile(legacy) and _inside(legacy, LEGACY_DIR):
+        return legacy
+    return None
 
 
 def place_to_str(place):
@@ -335,12 +397,55 @@ def meta_description(summary, max_len=155):
     return cut.rstrip(".,;:") + "…"
 
 
+def render_home(error=""):
+    with open(HOME_TEMPLATE, encoding="utf-8") as f:
+        doc = f.read()
+    error_html = f'<div class="card"><p>{esc(error)}</p></div>' if error else ""
+    return (
+        doc.replace("%%ERROR%%", error_html)
+        .replace("%%BASE_URL%%", html.escape(BASE_URL, quote=True))
+    )
+
+
+def render_simple(title, message):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{esc(title)} | TripAssembler</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <a class='brand' href='/'>
+    <svg class="logo-svg" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+  <rect width="36" height="36" rx="8" fill="#1e40af"/>
+  <path d="M8 22 L18 10 L28 22" stroke="white" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="18" cy="24" r="2" fill="white"/>
+</svg>
+    <h1>TripAssembler</h1>
+  </a>
+</header>
+<div class="container">
+  <div class="hero">
+    <h2>{esc(title)}</h2>
+    <p>{esc(message)}</p>
+  </div>
+  <a class="btn" href="/">Assemble a trip</a>
+</div>
+<footer>TripAssembler · Custom assemblies for real travel constraints · <a href="/sitemap.xml">Sitemap</a></footer>
+</body>
+</html>
+"""
+
+
 PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{title} | TripAssembler</title>
 <meta name="description" content="{meta_desc}">
 <link rel="canonical" href="{page_url}">
@@ -352,57 +457,63 @@ PAGE_TEMPLATE = """
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="{title}">
 <meta name="twitter:description" content="{meta_desc}">
+<link rel="stylesheet" href="/styles.css">
 <link rel="preconnect" href="https://www.google.com">
 <link rel="preconnect" href="https://maps.gstatic.com" crossorigin>
-<style>
-  body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 820px; margin: 40px auto; line-height: 1.65; padding: 0 20px; color: #111; }}
-  h1 {{ color: #004E89; font-size: 2rem; margin-bottom: 0.4em; }}
-  .meta {{ color: #555; margin-bottom: 1em; }}
-  .constraints {{ background: #f0f4f8; padding: 16px 18px; border-radius: 10px; margin: 1.2em 0; }}
-  .map-container {{ margin: 1.5em 0 0.6em 0; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }}
-  iframe {{ width: 100%; height: 420px; border: 0; }}
-  .map-links {{ margin: 0.4em 0 0.6em 0; }}
-  .stops {{ margin: 0 0 2em 1.2em; padding: 0; }}
-  .day {{ background: #fff; border: 1px solid #e5e7eb; padding: 18px; margin: 16px 0; border-radius: 10px; }}
-  .actions {{ margin: 2.5em 0; display: flex; gap: 10px; flex-wrap: wrap; }}
-  .btn {{ padding: 10px 16px; border-radius: 8px; border: 1px solid #ddd; background: #fff; text-decoration: none; color: #333; font-size: 0.95em; }}
-  .btn:hover {{ background: #f9fafb; }}
-  @media print {{ .actions, .map-container {{ display: none; }} }}
-</style>
 <script type="application/ld+json">{json_ld}</script>
 </head>
 <body>
-<article>
 <header>
-<h1>{title}</h1>
-<div class="meta"><strong>Location:</strong> {location}</div>
+  <a class='brand' href='/'>
+    <svg class="logo-svg" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+  <rect width="36" height="36" rx="8" fill="#1e40af"/>
+  <path d="M8 22 L18 10 L28 22" stroke="white" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="18" cy="24" r="2" fill="white"/>
+</svg>
+    <h1>TripAssembler</h1>
+  </a>
 </header>
-<div class="constraints"><strong>Key constraints:</strong> {constraints}</div>
-<p>{summary}</p>
-
-{map_html}
-
-<h2>Recommended Stays</h2>
-{hotels_html}
-
-<h2>Suggested Itinerary</h2>
-{itinerary_html}
-
-<h2>Getting Around</h2>
-<p>{transport}</p>
-
-<h2>Budget Notes</h2>
-<p>{budget_notes}</p>
-
-{faqs_html}
-
-{related_html}
-</article>
-<div class="actions">
-  <a class="btn" href="javascript:window.print()">Print / Save PDF</a>
-  <a class="btn" href="javascript:navigator.clipboard.writeText(location.href);alert('Link copied')">Copy share link</a>
-  <a class="btn" href="/">Assemble another trip</a>
+<div class="container">
+  <div class="page-icon">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#1e40af" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+  </div>
+  <h2 style="margin:0 0 8px;">{title}</h2>
+  <p style="color:var(--muted); margin-top:0;"><strong>Location:</strong> {location}</p>
+  <div class="card">
+    <h3 style="margin-top:0;">Key constraints</h3>
+    <p>{constraints}</p>
+    <p>{summary}</p>
+  </div>
+  <div class="card">
+    {map_html}
+  </div>
+  <div class="card">
+    <h2>Recommended Stays</h2>
+    {hotels_html}
+  </div>
+  <div class="card">
+    <h2>Suggested Itinerary</h2>
+    {itinerary_html}
+  </div>
+  <div class="card">
+    <h2>Getting Around</h2>
+    <p>{transport}</p>
+  </div>
+  <div class="card">
+    <h2>Budget Notes</h2>
+    <p>{budget_notes}</p>
+  </div>
+  {faqs_html}
+  {related_html}
+  <div class="actions">
+    <button type="button" onclick="window.print()">Print / Save PDF</button>
+    <button type="button" onclick="navigator.clipboard.writeText(location.href);alert('Link copied')">Copy share link</button>
+  </div>
+  <div class="cta">
+    <a class='btn' href='/' style='width:auto;'>Assemble another trip</a>
+  </div>
 </div>
+<footer>TripAssembler · Custom assemblies for real travel constraints · <a href="/sitemap.xml">Sitemap</a></footer>
 </body>
 </html>
 """
@@ -411,9 +522,12 @@ PAGE_TEMPLATE = """
 @app.middleware("http")
 async def cache_headers(request, call_next):
     response = await call_next(request)
+    if response.status_code != 200:
+        return response
     path = request.url.path
-    if path.startswith("/pages/") and path.endswith(".html"):
+    if path == "/styles.css" or (path.startswith("/pages/") and path not in {"/pages", "/pages/"}):
         # Slugs include a timestamp, so generated pages are effectively immutable.
+        # Legacy pages and the stylesheet are static assets served the same way.
         response.headers.setdefault("Cache-Control", "public, max-age=86400")
     elif path in {"/sitemap.xml", "/robots.txt"}:
         response.headers.setdefault("Cache-Control", "public, max-age=3600")
@@ -424,51 +538,22 @@ async def cache_headers(request, call_next):
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    index = load_index()
-    links = "".join(
-        f'<li><a href="/pages/{esc(item["slug"])}.html">{esc(item.get("title", "Trip"))}</a></li>'
-        for item in index
-        if item.get("slug")
-    )
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TripAssembler — Practical trip plans from your constraints</title>
-<meta name="description" content="Describe your trip constraints and TripAssembler will assemble a practical itinerary, stays, and route map.">
-<link rel="canonical" href="{BASE_URL}/">
-<style>
-  body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.65; color: #111; }}
-  h1 {{ color: #004E89; }}
-  button {{ padding: 12px 24px; background: #004E89; color: white; border: none; border-radius: 8px; font-size: 16px; }}
-</style>
-</head>
-<body>
-<h1>TripAssembler</h1>
-<p>Describe your trip constraints and I’ll assemble a practical plan.</p>
-<form id="tripForm" action="/assemble" method="post">
-  <textarea name="request" rows="6" style="width:100%;font-size:16px;padding:12px;border-radius:8px;border:1px solid #ccc;" placeholder="Example: 7 nights in Iceland for 5 adults in December. Need either a 3BR apartment or 2 hotel rooms under $500/night total. Include must-see towns, scenic drives, hot springs, and short hikes."></textarea>
-  <br><br>
-  <button type="submit" id="submitBtn">Assemble my trip</button>
-  <div id="loading" style="display:none;margin-top:16px;color:#004E89;">Assembling your trip… (usually 5–15 seconds)</div>
-</form>
-<script>
-  document.getElementById('tripForm').onsubmit = function() {{
-    document.getElementById('submitBtn').disabled = true;
-    document.getElementById('submitBtn').textContent = 'Assembling…';
-    document.getElementById('loading').style.display = 'block';
-  }};
-</script>
-<h2>Recent Assemblies</h2>
-<ul>{links or "<li>None yet</li>"}</ul>
-</body></html>
-"""
+    return render_home()
 
 
 @app.post("/assemble")
-async def assemble(request: str = Form(...)):
-    request = request.strip() or "a trip"
+async def assemble(
+    where: str = Form(""),
+    budget: str = Form(""),
+    who: str = Form(""),
+    must: str = Form(""),
+    when: str = Form(""),
+    captcha: str = Form(""),
+    request: str = Form(""),
+):
+    if str(captcha or "").strip() != "7":
+        return HTMLResponse(render_home("Please answer correctly."), status_code=400)
+    request = compose_request(where, budget, who, must, when, request)
     created_at = datetime.now(timezone.utc)
     stamp = created_at.strftime("%Y%m%d%H%M")
 
@@ -545,9 +630,13 @@ Guidelines:
     hotels_html = hotels_to_html(assembly.get("hotels", []))
     itinerary_html = itinerary_to_html(assembly.get("itinerary", []))
     faqs_html = faqs_to_html(assembly.get("faqs", []))
+    if faqs_html:
+        faqs_html = f'<div class="card">{faqs_html}</div>'
 
     index = load_index()
     related_html = related_to_html(index, slug, location)
+    if related_html:
+        related_html = f'<div class="card">{related_html}</div>'
 
     page_url = f"{BASE_URL}/pages/{slug}.html"
     summary = assembly.get("summary", "")
@@ -590,13 +679,29 @@ Guidelines:
 @app.get("/sitemap.xml")
 async def sitemap():
     index = load_index()
-    urls = [{"loc": f"{BASE_URL}/", "lastmod": None}]
+    generated_lastmod = {}
+    generated_order = []
     for item in index:
-        if not item.get("slug"):
+        slug = item.get("slug")
+        if not slug or slug in generated_lastmod:
+            continue
+        generated_lastmod[slug] = item.get("created_at")
+        generated_order.append(slug)
+
+    urls = [{"loc": f"{BASE_URL}/", "lastmod": None}]
+    seen = set()
+    for slug in legacy_slugs():
+        seen.add(slug)
+        urls.append({
+            "loc": f"{BASE_URL}/pages/{slug}.html",
+            "lastmod": generated_lastmod.get(slug),
+        })
+    for slug in generated_order:
+        if slug in seen:
             continue
         urls.append({
-            "loc": f"{BASE_URL}/pages/{item['slug']}.html",
-            "lastmod": item.get("created_at"),
+            "loc": f"{BASE_URL}/pages/{slug}.html",
+            "lastmod": generated_lastmod.get(slug),
         })
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -621,4 +726,19 @@ async def robots():
     )
 
 
-app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
+@app.get("/styles.css")
+async def styles_css():
+    if not os.path.isfile(STYLES_PATH):
+        return HTMLResponse(render_simple("Page not found", "That file is not here."), status_code=404)
+    return FileResponse(STYLES_PATH, media_type="text/css")
+
+
+@app.get("/pages/{slug}")
+async def serve_page(slug: str):
+    path = resolve_page_file(slug)
+    if not path:
+        return HTMLResponse(
+            render_simple("Page not found", "That trip page is not here."),
+            status_code=404,
+        )
+    return FileResponse(path, media_type="text/html")
