@@ -224,3 +224,7 @@ async def sitemap():
 @app.get("/robots.txt")
 async def robots():
     return HTMLResponse("User-agent: *\nAllow: /\nSitemap: https://tripassembler.onrender.com/sitemap.xml\n", media_type="text/plain")
+    
+PAGES_DIR = "/opt/render/project/src/pages"
+INDEX_FILE = "/opt/render/project/src/index.json"
+app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
