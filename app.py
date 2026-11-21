@@ -175,6 +175,10 @@ Guidelines:
         map_url = f"https://www.google.com/maps/embed/v1/directions?key={MAPS_KEY}&origin={origin}&destination={destination}"
         if waypoints:
             map_url += f"&waypoints={waypoints}"
+    elif MAPS_KEY and places:
+        from urllib.parse import quote
+        query = quote(places[0])
+        map_url = f"https://www.google.com/maps/embed/v1/search?key={MAPS_KEY}&q={query}"
     else:
         from urllib.parse import quote
         query = quote(assembly.get("location") or "travel")
