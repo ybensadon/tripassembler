@@ -165,52 +165,52 @@ Guidelines:
             "budget_notes": "—"
         }
 
-    # Build Google Maps embed URL
-    places = assembly.get("map_places", [])
-    if MAPS_KEY and places and len(places) >= 2:
-        from urllib.parse import quote
-        origin = quote(places[0])
-        destination = quote(places[-1])
-        waypoints = "|".join(quote(p) for p in places[1:-1])
-        map_url = f"https://www.google.com/maps/embed/v1/directions?key={MAPS_KEY}&origin={origin}&destination={destination}"
-        if waypoints:
-            map_url += f"&waypoints={waypoints}"
-    else:
-        from urllib.parse import quote
-        query = quote(assembly.get("location") or "travel")
-        map_url = f"https://www.google.com/maps/embed/v1/search?key={MAPS_KEY}&q={query}" if MAPS_KEY else "about:blank"
-    
-        hotels_html = "".join(
-            f"<p><strong>{h.get('name','')}</strong> ({h.get('area','')}) — {h.get('why','')} ({h.get('price_range','')})</p>"
-            for h in assembly.get("hotels", [])
-        )
-        itinerary_html = "".join(
-            f'<div class="day"><h3>Day {d.get("day","?")}: {d.get("title","")}</h3>'
-            f'<ul>{"".join(f"<li>{a}</li>" for a in d.get("activities",[]))}</ul>'
-            f'<p><em>{d.get("tips","")}</em></p></div>'
-            for d in assembly.get("itinerary", [])
-        )
-    
-        html = PAGE_TEMPLATE.format(
-            title=assembly.get("title", "Trip"),
-            location=assembly.get("location", ""),
-            constraints=", ".join(assembly.get("constraints", [])),
-            summary=assembly.get("summary", ""),
-            map_url=map_url,
-            hotels_html=hotels_html,
-            itinerary_html=itinerary_html,
-            transport=assembly.get("transport", ""),
-            budget_notes=assembly.get("budget_notes", "")
-        )
-    
-        with open(os.path.join(PAGES_DIR, f"{slug}.html"), "w") as f:
-            f.write(html)
-    
-        index = load_index()
-        index.insert(0, {"slug": slug, "title": assembly.get("title", "Trip")})
-        save_index(index)
-    
-        return RedirectResponse(f"/pages/{slug}.html", status_code=303)
+# Build Google Maps embed URL
+places = assembly.get("map_places", [])
+if MAPS_KEY and places and len(places) >= 2:
+    from urllib.parse import quote
+    origin = quote(places[0])
+    destination = quote(places[-1])
+    waypoints = "|".join(quote(p) for p in places[1:-1])
+    map_url = f"https://www.google.com/maps/embed/v1/directions?key={MAPS_KEY}&origin={origin}&destination={destination}"
+    if waypoints:
+        map_url += f"&waypoints={waypoints}"
+else:
+    from urllib.parse import quote
+    query = quote(assembly.get("location") or "travel")
+    map_url = f"https://www.google.com/maps/embed/v1/search?key={MAPS_KEY}&q={query}" if MAPS_KEY else "about:blank"
+
+    hotels_html = "".join(
+        f"<p><strong>{h.get('name','')}</strong> ({h.get('area','')}) — {h.get('why','')} ({h.get('price_range','')})</p>"
+        for h in assembly.get("hotels", [])
+    )
+    itinerary_html = "".join(
+        f'<div class="day"><h3>Day {d.get("day","?")}: {d.get("title","")}</h3>'
+        f'<ul>{"".join(f"<li>{a}</li>" for a in d.get("activities",[]))}</ul>'
+        f'<p><em>{d.get("tips","")}</em></p></div>'
+        for d in assembly.get("itinerary", [])
+    )
+
+    html = PAGE_TEMPLATE.format(
+        title=assembly.get("title", "Trip"),
+        location=assembly.get("location", ""),
+        constraints=", ".join(assembly.get("constraints", [])),
+        summary=assembly.get("summary", ""),
+        map_url=map_url,
+        hotels_html=hotels_html,
+        itinerary_html=itinerary_html,
+        transport=assembly.get("transport", ""),
+        budget_notes=assembly.get("budget_notes", "")
+    )
+
+    with open(os.path.join(PAGES_DIR, f"{slug}.html"), "w") as f:
+        f.write(html)
+
+    index = load_index()
+    index.insert(0, {"slug": slug, "title": assembly.get("title", "Trip")})
+    save_index(index)
+
+    return RedirectResponse(f"/pages/{slug}.html", status_code=303)
 
 @app.get("/sitemap.xml")
 async def sitemap():
