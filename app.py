@@ -166,19 +166,19 @@ Guidelines:
         }
 
     # Build Google Maps embed URL
-        places = assembly.get("map_places", [])
-        if MAPS_KEY and places and len(places) >= 2:
-            from urllib.parse import quote
-            origin = quote(places[0])
-            destination = quote(places[-1])
-            waypoints = "|".join(quote(p) for p in places[1:-1])
-            map_url = f"https://www.google.com/maps/embed/v1/directions?key={MAPS_KEY}&origin={origin}&destination={destination}"
-            if waypoints:
-                map_url += f"&waypoints={waypoints}"
-        else:
-            from urllib.parse import quote
-            query = quote(assembly.get("location") or "travel")
-            map_url = f"https://www.google.com/maps/embed/v1/search?key={MAPS_KEY}&q={query}" if MAPS_KEY else ""
+places = assembly.get("map_places", [])
+if MAPS_KEY and places and len(places) >= 2:
+    from urllib.parse import quote
+    origin = quote(places[0])
+    destination = quote(places[-1])
+    waypoints = "|".join(quote(p) for p in places[1:-1])
+    map_url = f"https://www.google.com/maps/embed/v1/directions?key={MAPS_KEY}&origin={origin}&destination={destination}"
+    if waypoints:
+        map_url += f"&waypoints={waypoints}"
+else:
+    from urllib.parse import quote
+    query = quote(assembly.get("location") or "travel")
+    map_url = f"https://www.google.com/maps/embed/v1/search?key={MAPS_KEY}&q={query}" if MAPS_KEY else "about:blank"
     
         hotels_html = "".join(
             f"<p><strong>{h.get('name','')}</strong> ({h.get('area','')}) — {h.get('why','')} ({h.get('price_range','')})</p>"
