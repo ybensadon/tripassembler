@@ -186,5 +186,14 @@ Guidelines:
     save_index(index)
 
     return RedirectResponse(f"/pages/{slug}.html", status_code=303)
-
+@app.get("/sitemap.xml")
+async def sitemap():
+    index = load_index()
+    base = "https://tripassembler.onrender.com"  # change if you use a custom domain later
+    urls = [f"{base}/"] + [f"{base}/pages/{item['slug']}.html" for item in index]
+    xml = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    for url in urls:
+        xml += f"  <url><loc>{url}</loc></url>\n"
+    xml += "</urlset>"
+    return HTMLResponse(content=xml, media_type="application/xml")
 app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
