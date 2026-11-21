@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TripAssembler — Custom trip assemblies matched to your constraints</title>
+<meta name="description" content="Tell us your real constraints. We assemble a fresh custom comparison of the best options.">
+<link rel="canonical" href="%%BASE_URL%%/">
+<meta property="og:title" content="TripAssembler — Custom trip assemblies matched to your constraints">
+<meta property="og:description" content="Tell us your real constraints. We assemble a fresh custom comparison of the best options.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="%%BASE_URL%%/">
+<meta property="og:site_name" content="TripAssembler">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <a class='brand' href='/'>
+    <svg class="logo-svg" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+  <rect width="36" height="36" rx="8" fill="#1e40af"/>
+  <path d="M8 22 L18 10 L28 22" stroke="white" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="18" cy="24" r="2" fill="white"/>
+</svg>
+    <h1>TripAssembler</h1>
+  </a>
+</header>
+<div class="container">
+  <div class="hero">
+    <h2>Assemble the perfect stay</h2>
+    <p>Your constraints. Fresh every time.</p>
+  </div>
+  %%ERROR%%
+  <form id="assembleForm" action="/assemble" method="post">
+    <div class="card">
+      <label><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e40af" stroke-width="2"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg> Where do you want to go?</label>
+      <input type="text" name="where" placeholder="City, region, or area" required>
+      <div class="hint">Examples: Reykjavik, near the Blue Lagoon, Santorini</div>
+    </div>
+    <div class="card">
+      <label><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e40af" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg> Budget</label>
+      <input type="text" name="budget" placeholder="e.g. under $400 per night">
+      <div class="hint">Per night, total, or flexible</div>
+    </div>
+    <div class="card">
+      <label><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e40af" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg> Who’s coming and space needed</label>
+      <input type="text" name="who" placeholder="2 adults + 2 kids, 2 bedrooms">
+      <div class="hint">Group size, bedrooms, pets, etc.</div>
+    </div>
+    <div class="card">
+      <label><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e40af" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg> Must-haves and vibe</label>
+      <textarea name="must" rows="2" placeholder="Kitchen, quiet, near the harbor"></textarea>
+      <div class="hint">Features, location feel, deal-breakers</div>
+    </div>
+    <div class="card">
+      <label><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#1e40af" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> Timing and other notes</label>
+      <input type="text" name="when" placeholder="Late September, 5 nights">
+      <div class="hint">Dates, season, or extra requirements</div>
+    </div>
+    <div class="captcha">
+      <label>Verification: What is 3 + 4?</label>
+      <input type="text" name="captcha" placeholder="Answer" required style="width:140px; margin-top:8px;">
+    </div>
+    <button type="submit" class="btn">Assemble my trip</button>
+  </form>
+  <div class="cta">
+    <strong>Looking for inspiration?</strong>
+    Browse popular assemblies below.
+  </div>
+  <div class="examples">
+    <a class='example' href='/pages/bangkok-pet-friendly'><strong>Best pet-friendly in Bangkok</strong><small>Bangkok</small></a>
+    <a class='example' href='/pages/london-family-friendly-with-kitchen'><strong>Best family-friendly with kitchen in London</strong><small>London</small></a>
+    <a class='example' href='/pages/tokyo-family-friendly-with-kitchen'><strong>Best family-friendly with kitchen in Tokyo</strong><small>Tokyo</small></a>
+    <a class='example' href='/pages/tokyo-mountain-or-nature-view'><strong>Best mountain or nature view in Tokyo</strong><small>Tokyo</small></a>
+    <a class='example' href='/pages/los-angeles-family-friendly-with-kitchen'><strong>Best family-friendly with kitchen in Los Angeles</strong><small>Los Angeles</small></a>
+    <a class='example' href='/pages/kyoto-luxury-with-ocean-view'><strong>Best luxury with ocean view in Kyoto</strong><small>Kyoto</small></a>
+    <a class='example' href='/pages/new-york-family-friendly-with-kitchen'><strong>Best family-friendly with kitchen in New York</strong><small>New York</small></a>
+    <a class='example' href='/pages/cancun-luxury-with-ocean-view'><strong>Best luxury with ocean view in Cancun</strong><small>Cancun</small></a>
+    <a class='example' href='/pages/maui-with-private-pool'><strong>Best with private pool in Maui</strong><small>Maui</small></a>
+    <a class='example' href='/pages/london-budget-under-200night'><strong>Best budget under $200/night in London</strong><small>London</small></a>
+    <a class='example' href='/pages/paris-mountain-or-nature-view'><strong>Best mountain or nature view in Paris</strong><small>Paris</small></a>
+    <a class='example' href='/pages/osaka-family-friendly-with-kitchen'><strong>Best family-friendly with kitchen in Osaka</strong><small>Osaka</small></a>
+  </div>
+</div>
+<footer>TripAssembler · Custom assemblies for real travel constraints · <a href="sitemap.xml">Sitemap</a></footer>
+<script>
+document.getElementById('assembleForm').onsubmit = function(e) {
+  if (this.captcha.value.trim() !== '7') { alert('Please answer correctly.'); e.preventDefault(); return; }
+  var btn = this.querySelector('button[type="submit"]');
+  if (!btn || btn.dataset.submitted === '1') { e.preventDefault(); return; }
+  btn.dataset.submitted = '1';
+  btn.textContent = 'Assembling your trip…';
+  setTimeout(function() { btn.disabled = true; }, 0);
+};
+</script>
+</body>
+</html>
