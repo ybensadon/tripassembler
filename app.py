@@ -210,7 +210,6 @@ Guidelines:
 
     return RedirectResponse(f"/pages/{slug}.html", status_code=303)
 
-# Sitemap + robots
 @app.get("/sitemap.xml")
 async def sitemap():
     index = load_index()
@@ -225,5 +224,3 @@ async def sitemap():
 @app.get("/robots.txt")
 async def robots():
     return HTMLResponse("User-agent: *\nAllow: /\nSitemap: https://tripassembler.onrender.com/sitemap.xml\n", media_type="text/plain")
-
-app.mount("/pages", StaticFiles(directory=PAGES_DIR), name="pages")
