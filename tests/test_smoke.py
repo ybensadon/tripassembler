@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from urllib.parse import unquote
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="tripassembler-test-")
@@ -106,6 +107,21 @@ WIKI_CALLS = []
 WIKI_MODE = {"empty": False}
 
 
+def _photo_identity(url):
+    if "Reykjav" in url:
+        return "Reykjavik", "Reykjavík"
+    if "Hallgr" in url:
+        return "Hallgrimskirkja", "Hallgrímskirkja"
+    if "Harpa" in url:
+        return "Harpa", "Harpa (concert hall)"
+    decoded = unquote(url)
+    match = re.search(r"(?:gsrsearch|titles)=([^&]+)", decoded)
+    raw = match.group(1) if match else "Place"
+    token = re.sub(r"[^A-Za-z0-9]+", "", raw)[:48] or "Place"
+    title = re.split(r"[, ]", raw.strip())[0] or token
+    return token, title
+
+
 def wiki_handler(request):
     url = str(request.url)
     WIKI_CALLS.append(url)
@@ -115,8 +131,11 @@ def wiki_handler(request):
         if "rest_v1" in url:
             return httpx.Response(404, json={"type": "not_found"})
         return httpx.Response(200, json={"query": {"pages": {"-1": {"missing": ""}}}})
-    title = "Reykjavík" if "Reykjav" in url else "Hallgrímskirkja"
-    slug = "Reykjavik" if "Reykjav" in url else "Hallgrimskirkja"
+    if "prop=imageinfo" in url or "iiurlwidth=" in url:
+        return httpx.Response(200, json={"query": {"pages": {}}})
+    if "prop=images" in url or "imlimit=" in url:
+        return httpx.Response(200, json={"query": {"pages": {"1": {"title": "Place", "images": []}}}})
+    slug, title = _photo_identity(url)
     if "rest_v1" in url:
         return httpx.Response(200, json={
             "type": "standard",
@@ -139,7 +158,7 @@ def wiki_handler(request):
     }}}})
 
 
-def fake_wiki_client():
+def fake_wiki_client(*args, **kwargs):
     return httpx.AsyncClient(transport=httpx.MockTransport(wiki_handler), timeout=3.0)
 
 
@@ -160,6 +179,7 @@ class SmokeTests(unittest.TestCase):
         app._page_mem.clear()
         app._catalog["key"] = None
         app._catalog["items"] = []
+        app.reset_assignments()
         WIKI_CALLS.clear()
         WIKI_MODE["empty"] = False
         cache = os.environ["WIKI_CACHE"]
@@ -590,11 +610,11 @@ class SmokeTests(unittest.TestCase):
     def test_image_lookup_failure_serves_original(self):
         disk = os.path.join(os.environ["PAGES_DIR"], "old-porto-notes.html")
         original = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>Old Porto notes | TripAssembler</title></head>
+<html lang="en"><head><meta charset="UTF-8"><title>Old Porto notes in Lisbon | TripAssembler</title></head>
 <body>
 <header><a class="brand" href="/"><h1>TripAssembler</h1></a></header>
 <div class="container">
-  <h2>Old Porto notes</h2>
+  <h2>Old Porto notes in Lisbon</h2>
   <p>Assemble the perfect stay</p>
   <p>The cellars are still in this page.</p>
   <div class="actions"><button>Print</button></div>
@@ -605,15 +625,15 @@ class SmokeTests(unittest.TestCase):
         with open(disk, "w", encoding="utf-8") as handle:
             handle.write(original)
 
-        async def explode(specs, timeout=8.0):
+        async def explode(*args, **kwargs):
             raise RuntimeError("wiki down")
 
-        original_resolve = app.resolve_images
-        app.resolve_images = explode
+        original_assign = app.assign_hero_image
+        app.assign_hero_image = explode
         try:
             response = self.client.get("/pages/old-porto-notes")
         finally:
-            app.resolve_images = original_resolve
+            app.assign_hero_image = original_assign
         self.assertEqual(response.status_code, 200)
         self.assertIn("Old Porto notes", response.text)
         self.assertIn("The cellars are still in this page.", response.text)
@@ -639,6 +659,169 @@ class SmokeTests(unittest.TestCase):
         app._page_mem.clear()
         self.client.get("/pages/old-porto-notes")
         self.assertEqual(len(WIKI_CALLS), calls_after)
+
+    def test_same_city_heroes_are_distinct(self):
+        pool = []
+        for index in range(4):
+            pool.append({
+                "file": f"photo-{index}.jpg",
+                "src": f"https://upload.wikimedia.org/wikipedia/commons/photo-{index}.jpg",
+                "width": 640,
+                "height": 400,
+                "page": f"https://en.wikipedia.org/wiki/Photo_{index}",
+                "title": f"Photo {index}",
+            })
+        self.assertTrue(app.is_real_photo(pool[0]["src"], "Photo 0"))
+        self.assertFalse(app.is_real_photo(
+            "https://upload.wikimedia.org/wikipedia/commons/Flag_of_Amsterdam.svg",
+            "Flag of Amsterdam.svg",
+        ))
+        self.assertFalse(app.is_real_photo(
+            "https://upload.wikimedia.org/wikipedia/commons/Map_of_Amsterdam.png",
+            "Map of Amsterdam.png",
+        ))
+        taken = set()
+        picked = []
+        for slug in ("amsterdam-pet-friendly", "amsterdam-with-private-pool", "amsterdam-walkable"):
+            image = app.choose_distinct(slug, pool, taken)
+            self.assertIsNotNone(image)
+            self.assertNotIn(image["file"], taken)
+            taken.add(image["file"])
+            picked.append(image["file"])
+        again = app.choose_distinct("amsterdam-pet-friendly", pool, set())
+        self.assertEqual(again["file"], picked[0])
+
+        photos = [
+            ("Canal_houses.jpg", "Canal houses"),
+            ("Rijksmuseum.jpg", "Rijksmuseum"),
+            ("Vondelpark.jpg", "Vondelpark"),
+            ("Jordaan_street.jpg", "Jordaan"),
+        ]
+
+        def rich_handler(request):
+            url = unquote(str(request.url))
+            WIKI_CALLS.append(url)
+            if "prop=imageinfo" in url or "iiurlwidth=" in url:
+                pages = {}
+                for index, (name, label) in enumerate(photos, start=1):
+                    if name not in url and label not in url and "File:" not in url:
+                        continue
+                    pages[str(index)] = {
+                        "title": f"File:{name}",
+                        "imageinfo": [{
+                            "thumburl": f"https://upload.wikimedia.org/wikipedia/commons/thumb/a/a{index}/{name}/640px-{name}",
+                            "thumbwidth": 640,
+                            "thumbheight": 400 + index,
+                            "mime": "image/jpeg",
+                            "descriptionurl": f"https://commons.wikimedia.org/wiki/File:{name}",
+                        }],
+                    }
+                return httpx.Response(200, json={"query": {"pages": pages}})
+            if "prop=images" in url or "imlimit=" in url:
+                images = [{"title": f"File:{name}"} for name, _label in photos]
+                images.append({"title": "File:Flag_of_Amsterdam.svg"})
+                images.append({"title": "File:Map_of_Amsterdam.png"})
+                return httpx.Response(200, json={"query": {"pages": {"12": {
+                    "title": "Amsterdam",
+                    "images": images,
+                }}}})
+            pages = {
+                "50": {
+                    "index": 0,
+                    "title": "Map of Amsterdam",
+                    "thumbnail": {
+                        "source": "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Map_of_Amsterdam.png/640px-Map_of_Amsterdam.png",
+                        "width": 640,
+                        "height": 480,
+                    },
+                    "fullurl": "https://en.wikipedia.org/wiki/Map_of_Amsterdam",
+                },
+            }
+            for index, (name, label) in enumerate(photos, start=1):
+                pages[str(index)] = {
+                    "index": index,
+                    "title": label,
+                    "thumbnail": {
+                        "source": f"https://thumb.wikimedia.org/wikipedia/commons/thumb/b/b{index}/{name}/640px-{name}",
+                        "width": 640,
+                        "height": 420,
+                    },
+                    "fullurl": f"https://en.wikipedia.org/wiki/{label.replace(' ', '_')}",
+                }
+            return httpx.Response(200, json={"query": {"pages": pages}})
+
+        legacy_dir = tempfile.mkdtemp(prefix="tripassembler-distinct-")
+        original_legacy = app.LEGACY_DIR
+        original_client = app.wiki_client
+        app.LEGACY_DIR = legacy_dir
+        app._catalog["key"] = None
+        app.wiki_client = lambda *args, **kwargs: httpx.AsyncClient(
+            transport=httpx.MockTransport(rich_handler), timeout=3.0,
+        )
+        try:
+            self._write_legacy(
+                legacy_dir,
+                "amsterdam-pet-friendly",
+                "Best pet-friendly in Amsterdam",
+                "Assembled for pet-friendly in Amsterdam.",
+                stops=["Vondelpark, Amsterdam"],
+            )
+            self._write_legacy(
+                legacy_dir,
+                "amsterdam-with-private-pool",
+                "Best with private pool in Amsterdam",
+                "Assembled for a private pool in Amsterdam.",
+                stops=["Vondelpark, Amsterdam"],
+            )
+            self._write_legacy(
+                legacy_dir,
+                "paris-pet-friendly",
+                "Best pet-friendly in Paris",
+                "Assembled for pet-friendly in Paris.",
+            )
+            first = self.client.get("/pages/amsterdam-pet-friendly")
+            second = self.client.get("/pages/amsterdam-with-private-pool")
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            hero_one = re.search(r'<figure class="hero-photo"><img src="([^"]+)"', first.text)
+            hero_two = re.search(r'<figure class="hero-photo"><img src="([^"]+)"', second.text)
+            self.assertIsNotNone(hero_one)
+            self.assertIsNotNone(hero_two)
+            self.assertNotEqual(hero_one.group(1), hero_two.group(1))
+            self.assertNotIn("Map_of_Amsterdam", hero_one.group(1))
+            self.assertNotIn("Flag_of_Amsterdam", hero_one.group(1))
+            self.assertNotIn(".svg", hero_one.group(1).lower())
+            self.assertIn("wikipedia.org", first.text.lower() + "wikimedia.org")
+            self.assertRegex(first.text, r'class="hero-photo">.*href="https://[^"]+"', re.S)
+            # The stop names the same park the pool may also contain. It must not repeat the hero.
+            if 'class="stop-thumb"' in first.text:
+                stop_src = re.search(r'class="stop-thumb" src="([^"]+)"', first.text).group(1)
+                self.assertNotEqual(stop_src, hero_one.group(1))
+            store = app.load_assignments()
+            assigned = store["amsterdam|netherlands"]["assigned"]
+            self.assertNotEqual(
+                assigned["amsterdam-pet-friendly"]["file"],
+                assigned["amsterdam-with-private-pool"]["file"],
+            )
+            section = app.related_section_html(
+                "amsterdam-pet-friendly",
+                "Best pet-friendly in Amsterdam",
+                "",
+            )
+            self.assertIn(hero_two.group(1), section)
+            self.assertNotIn(hero_one.group(1), section)
+            calls_after = len(WIKI_CALLS)
+            app._page_mem.clear()
+            repeat = self.client.get("/pages/amsterdam-pet-friendly")
+            self.assertEqual(repeat.status_code, 200)
+            self.assertEqual(len(WIKI_CALLS), calls_after)
+            self.assertIn(hero_one.group(1), repeat.text)
+        finally:
+            app.wiki_client = original_client
+            app.LEGACY_DIR = original_legacy
+            app._catalog["key"] = None
+            app._catalog["items"] = []
+            shutil.rmtree(legacy_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

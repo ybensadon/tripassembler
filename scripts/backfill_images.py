@@ -16,6 +16,7 @@ That updates legacy pages in ``legacy_pages/`` and generated HTML in
 import argparse
 import asyncio
 import os
+import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,6 +81,107 @@ async def warm(queries):
         print(f"looked up {min(start + len(chunk), len(pending))}/{len(pending)} destinations", flush=True)
 
 
+async def assign_distinct(infos):
+    """One shared photo pool per city, then a different photo for each slug."""
+    groups = {}
+    for info in infos:
+        groups.setdefault(app.location_key(info) or info.get("slug") or "trip", []).append(info)
+    store = app.load_assignments()
+    for loc in list(groups):
+        store.pop(loc, None)
+    app.save_assignments()
+    for loc, group in groups.items():
+        group.sort(key=lambda item: item.get("slug") or "")
+        extra = []
+        for info in group:
+            extra.extend(app.pool_queries(info))
+        pool = await app.build_location_pool(group[0], extra_queries=extra, timeout=20.0)
+        bucket = {"pool": pool, "assigned": {}}
+        taken = set()
+        for info in group:
+            image = app.choose_distinct(info.get("slug") or "", pool, taken)
+            if not image:
+                continue
+            taken.add(image["file"])
+            bucket["assigned"][info["slug"]] = image
+            app.remember_image(image, info["slug"])
+        store[loc] = bucket
+        app.save_assignments()
+        print(f"pool {loc}: {len(pool)} photos for {len(group)} pages", flush=True)
+        await asyncio.sleep(0.35)
+
+
+async def enhance_distinct(pairs):
+    prepared = []
+    infos = []
+    for path, slug in pairs:
+        original = app.read_text(path)
+        document = app.strip_enhanced_media(original)
+        info = app.context_for(slug, document)
+        prepared.append((path, slug, original, document, info))
+        infos.append(info)
+    await assign_distinct(infos)
+    wrote = 0
+    failed = 0
+    kept = 0
+    for path, slug, original, document, info in prepared:
+        try:
+            updated = await app.enhance_document(slug, document)
+        except Exception as exc:
+            failed += 1
+            print(f"fail {slug}: {exc}", flush=True)
+            continue
+        if 'class="hero-photo"' not in updated and 'class="hero-photo"' in original:
+            kept += 1
+            print(f"kept {slug} (new pass had no photo)", flush=True)
+            continue
+        if updated != original:
+            app.write_text_atomic(path, updated)
+            wrote += 1
+            print(f"updated {slug}", flush=True)
+        else:
+            print(f"unchanged {slug}", flush=True)
+    return 0, wrote, failed + kept
+
+
+def hero_duplicate_report(directory):
+    from collections import Counter, defaultdict
+    groups = defaultdict(list)
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".html"):
+            continue
+        slug = name[:-5]
+        text = app.read_text(os.path.join(directory, name))
+        match = re.search(r'<figure class="hero-photo"><img src="([^"]+)"', text)
+        src = ""
+        if match:
+            import html as html_mod
+            src = html_mod.unescape(match.group(1))
+        info = app.describe_trip(slug, app.page_title_from_html(text))
+        loc = app.location_key(info) or slug
+        groups[loc].append((slug, src, app.photo_file_key(src)))
+    duplicate_locations = {}
+    shared = 0
+    for loc, rows in groups.items():
+        if len(rows) < 2:
+            continue
+        shared += 1
+        counts = Counter(key for _, _, key in rows if key)
+        dups = {key: count for key, count in counts.items() if count > 1}
+        if dups:
+            duplicate_locations[loc] = {
+                "pages": len(rows),
+                "unique": len(counts),
+                "duplicates": dups,
+            }
+    return {
+        "pages": sum(len(rows) for rows in groups.values()),
+        "locations": len(groups),
+        "shared_locations": shared,
+        "duplicate_locations": duplicate_locations,
+    }
+
+
 async def enhance_all(pairs, force):
     work = []
     skipped = 0
@@ -119,6 +221,11 @@ def main():
     parser.add_argument("--legacy-only", action="store_true", help="Only update legacy_pages.")
     parser.add_argument("--pages-only", action="store_true", help="Only update generated pages.")
     parser.add_argument("--force", action="store_true", help="Retry enhanced pages that still have no hero image.")
+    parser.add_argument(
+        "--distinct",
+        action="store_true",
+        help="Rebuild photos so pages for the same city do not share a hero.",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Stop after this many pages (0 means all).")
     args = parser.parse_args()
     if args.legacy_dir:
@@ -132,9 +239,25 @@ def main():
     if not pairs:
         print("No pages to enhance.")
         return 0
-    skipped, wrote, failed = asyncio.run(enhance_all(pairs, args.force))
+    report = {"duplicate_locations": {}}
+    if args.distinct:
+        skipped, wrote, failed = asyncio.run(enhance_distinct(pairs))
+    else:
+        skipped, wrote, failed = asyncio.run(enhance_all(pairs, args.force))
     print(f"done: wrote {wrote}, skipped {skipped}, failed {failed}, seen {len(pairs)}")
-    return 1 if failed else 0
+    if args.legacy_only or not args.pages_only:
+        report = hero_duplicate_report(app.LEGACY_DIR)
+        print(
+            "legacy heroes: {pages} pages, {locations} locations, "
+            "{shared_locations} locations with more than one page, "
+            "{dups} locations with a repeated hero".format(
+                dups=len(report["duplicate_locations"]),
+                **report,
+            )
+        )
+        for loc, detail in sorted(report["duplicate_locations"].items()):
+            print(f"  duplicate {loc}: {detail}")
+    return 1 if failed or (args.distinct and report.get("duplicate_locations")) else 0
 
 
 if __name__ == "__main__":
