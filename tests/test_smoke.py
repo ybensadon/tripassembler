@@ -1,6 +1,8 @@
 """Smoke tests with OpenAI and Wikipedia mocked. No network."""
 import json
 import os
+import re
+import shutil
 import sys
 import tempfile
 import time
@@ -100,8 +102,15 @@ class FakeClient:
         self.chat = Chat()
 
 
+WIKI_CALLS = []
+WIKI_MODE = {"empty": False}
+
+
 def wiki_handler(request):
     url = str(request.url)
+    WIKI_CALLS.append(url)
+    if WIKI_MODE["empty"]:
+        return httpx.Response(503, text="unavailable")
     if "MissingPlace" in url or "Nowhere" in url:
         if "rest_v1" in url:
             return httpx.Response(404, json={"type": "not_found"})
@@ -148,13 +157,22 @@ class SmokeTests(unittest.TestCase):
         app.JOBS.clear()
         app._image_cache.clear()
         app._cache_loaded = True
+        app._page_mem.clear()
+        app._catalog["key"] = None
+        app._catalog["items"] = []
+        WIKI_CALLS.clear()
+        WIKI_MODE["empty"] = False
         cache = os.environ["WIKI_CACHE"]
         if os.path.exists(cache):
             os.remove(cache)
         pages = os.environ["PAGES_DIR"]
         if os.path.isdir(pages):
             for name in os.listdir(pages):
-                os.remove(os.path.join(pages, name))
+                target = os.path.join(pages, name)
+                if os.path.isdir(target):
+                    shutil.rmtree(target)
+                else:
+                    os.remove(target)
         index = os.environ["INDEX_FILE"]
         if os.path.exists(index):
             os.remove(index)
@@ -182,6 +200,8 @@ class SmokeTests(unittest.TestCase):
         self.assertIn('action="/assemble"', text)
         self.assertIn("role=\"meter\"", text)
         self.assertIn("Add a destination so we know where to plan.", text)
+        self.assertIn("Assemble the perfect Trip", text)
+        self.assertNotIn("perfect stay", text.lower())
         self.assertIn(f"/styles.css?v={app.STYLES_VERSION}", text)
         self.assertIn("Best pet-friendly in Bangkok", text)
         self.assertIn("logo-svg", text)
@@ -312,6 +332,12 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("Open route in Google Maps", page.text)
         self.assertIn("TouristTrip", page.text)
         self.assertIn("FAQPage", page.text)
+        self.assertIn("Assemble the perfect Trip", page.text)
+        self.assertNotIn("perfect stay", page.text.lower())
+        self.assertEqual(page.text.count('id="related-trips"'), 1)
+        related = page.text.split('id="related-trips"', 1)[1].split("</section>", 1)[0]
+        related_links = re.findall(r'href="(/pages/[^"]+)"', related)
+        self.assertGreaterEqual(len(related_links), 3)
         self.assertIn(f"/styles.css?v={app.STYLES_VERSION}", page.text)
         self.assertNotIn("MissingPlace", page.text.split("Nowhere Special")[1][:400])
 
@@ -358,12 +384,20 @@ class SmokeTests(unittest.TestCase):
         junk = self.client.get("/assembling/not-a-job")
         self.assertEqual(junk.status_code, 404)
         self.assertIn("restarted", junk.text.lower())
+        self.assertIn("Assemble the perfect Trip", junk.text)
+        self.assertNotIn("perfect stay", junk.text.lower())
 
     def test_legacy_sitemap_health_and_css(self):
         legacy = self.client.get("/pages/amsterdam-city-center-walkable")
         self.assertEqual(legacy.status_code, 200)
         self.assertIn("Amsterdam", legacy.text)
         self.assertIn("Assemble a new trip", legacy.text)
+        self.assert_enhanced_page(legacy.text, require_stops=False)
+        calls_after_first = len(WIKI_CALLS)
+        again = self.client.get("/pages/amsterdam-city-center-walkable")
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(len(WIKI_CALLS), calls_after_first)
+        self.assertEqual(again.text.count('id="related-trips"'), 1)
         robots = self.client.get("/robots.txt")
         self.assertIn("Sitemap:", robots.text)
         self.assertIn("/assembling/", robots.text)
@@ -380,6 +414,231 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("max-age=86400", plain.headers["cache-control"])
         self.assertNotIn("immutable", plain.headers["cache-control"])
         self.assertTrue(any(getattr(m, "cls", None) is GZipMiddleware for m in app.app.user_middleware))
+
+    def assert_enhanced_page(self, text, require_stops=False, slug=""):
+        self.assertIn('class="hero-photo"', text)
+        self.assertIn('loading="lazy"', text)
+        self.assertIn('decoding="async"', text)
+        self.assertRegex(text, r'width="\d+"')
+        self.assertRegex(text, r'height="\d+"')
+        self.assertRegex(text, r'alt="[^"]+"')
+        self.assertIn("Wikipedia", text)
+        self.assertIn("wikipedia.org", text)
+        self.assertIn("Assemble the perfect Trip", text)
+        self.assertNotIn("perfect stay", text.lower())
+        self.assertEqual(text.count('id="related-trips"'), 1)
+        self.assertNotIn("More trip assemblies", text)
+        section = text.split('id="related-trips"', 1)[1].split("</section>", 1)[0]
+        links = re.findall(r'href="(/pages/[^"]+\.html)"', section)
+        self.assertGreaterEqual(len(links), 3)
+        self.assertTrue(all(link.startswith("/pages/") for link in links))
+        if slug:
+            self.assertNotIn(f"/pages/{slug}.html", links)
+        if require_stops:
+            self.assertIn('class="stop-thumb"', text)
+        # Photos that failed to resolve must not leave an empty image.
+        self.assertNotIn('src=""', text)
+        if "<h2" in text and 'class="hero-photo"' in text:
+            self.assertLess(text.find("</h2>"), text.find('class="hero-photo"'))
+
+    def _write_legacy(self, directory, slug, title, summary, stops=None):
+        stop_html = ""
+        if stops:
+            items = "".join(
+                f'<li><a href="https://www.google.com/maps/search/?api=1&query={label}">{label}</a></li>'
+                for label in stops
+            )
+            stop_html = f'<ol class="stops">{items}</ol>'
+        document = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>{title} | TripAssembler</title></head>
+<body>
+<header><a class="brand" href="/"><h1>TripAssembler</h1></a></header>
+<div class="container">
+  <div class="page-icon"><svg></svg></div>
+  <h2 style="margin:0 0 8px;">{title}</h2>
+  <p style="color:var(--muted); margin-top:0;">{summary}</p>
+  <div class="card"><h3>Recommended options</h3>{stop_html}</div>
+  <div class="actions"><button>Save</button></div>
+</div>
+<footer><a href="/">Home</a></footer>
+</body></html>
+"""
+        with open(os.path.join(directory, slug + ".html"), "w", encoding="utf-8") as handle:
+            handle.write(document)
+
+    def test_serve_time_images_related_and_cache(self):
+        legacy_dir = tempfile.mkdtemp(prefix="tripassembler-legacy-")
+        original_legacy = app.LEGACY_DIR
+        app.LEGACY_DIR = legacy_dir
+        app._catalog["key"] = None
+        try:
+            self._write_legacy(
+                legacy_dir,
+                "lisbon-pet-friendly",
+                "Best pet-friendly in Lisbon",
+                "Assembled for pet-friendly in Lisbon.",
+                stops=["Belem Tower, Lisbon, Portugal"],
+            )
+            self._write_legacy(
+                legacy_dir,
+                "lisbon-family-friendly-with-kitchen",
+                "Best family-friendly with kitchen in Lisbon",
+                "Assembled for family-friendly with kitchen in Lisbon.",
+            )
+            self._write_legacy(
+                legacy_dir,
+                "lisbon-budget-under-200night",
+                "Best budget under $200/night in Lisbon",
+                "Assembled for budget under $200/night in Lisbon.",
+            )
+            self._write_legacy(
+                legacy_dir,
+                "paris-pet-friendly",
+                "Best pet-friendly in Paris",
+                "Assembled for pet-friendly in Paris.",
+            )
+            disk = os.path.join(os.environ["PAGES_DIR"], "old-lisbon-weekend.html")
+            disk_html = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Old Lisbon weekend | TripAssembler</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TouristTrip","name":"Old Lisbon weekend","description":"A walk along the river.","touristDestination":{"@type":"Place","name":"Lisbon, Portugal"}}]}</script>
+</head><body>
+<header><a class="brand" href="/"><h1>TripAssembler</h1></a></header>
+<div class="container">
+  <div class="page-icon"><svg></svg></div>
+  <h2 style="margin:0 0 8px;">Old Lisbon weekend</h2>
+  <p style="color:var(--muted); margin-top:0;"><strong>Location:</strong> Lisbon, Portugal</p>
+  <p class="old-tag">Assemble the perfect stay</p>
+  <div class="card">
+    <h2>Route map</h2>
+    <ol class="stops">
+      <li><a href="https://www.google.com/maps/search/?api=1&query=Belem">Belem Tower, Lisbon, Portugal</a></li>
+      <li><a href="https://www.google.com/maps/search/?api=1&query=Jeronimos">Jeronimos Monastery, Lisbon, Portugal</a></li>
+    </ol>
+  </div>
+  <div class="card">
+    <h2>Suggested Itinerary</h2>
+    <div class="day"><h3>Day 1: Belem Tower and the river</h3><p>Walk the waterfront.</p></div>
+  </div>
+  <div class="card"><h2>More trip assemblies</h2><ul><li><a href="/pages/paris-pet-friendly.html">Paris</a></li></ul></div>
+  <div class="actions"><button type="button">Print / Save PDF</button></div>
+</div>
+<footer>TripAssembler</footer>
+</body></html>
+"""
+            with open(disk, "w", encoding="utf-8") as handle:
+                handle.write(disk_html)
+            with open(os.environ["INDEX_FILE"], "w", encoding="utf-8") as handle:
+                json.dump([{
+                    "slug": "old-lisbon-weekend",
+                    "title": "Old Lisbon weekend",
+                    "location": "Lisbon, Portugal",
+                    "created_at": "2024-05-01",
+                }], handle)
+
+            legacy = self.client.get("/pages/lisbon-pet-friendly")
+            self.assertEqual(legacy.status_code, 200)
+            self.assert_enhanced_page(legacy.text, require_stops=True, slug="lisbon-pet-friendly")
+            self.assertIn("Best pet-friendly in Lisbon", legacy.text)
+
+            disk_response = self.client.get("/pages/old-lisbon-weekend")
+            self.assertEqual(disk_response.status_code, 200)
+            self.assert_enhanced_page(disk_response.text, require_stops=True, slug="old-lisbon-weekend")
+            self.assertIn('class="day-photo"', disk_response.text)
+            self.assertIn("Walk the waterfront.", disk_response.text)
+            block = re.search(
+                r'<script type="application/ld\+json">(.*?)</script>',
+                disk_response.text,
+                re.S,
+            )
+            self.assertIsNotNone(block)
+            data = json.loads(block.group(1).replace("<\\/", "</"))
+            self.assertEqual(data["@graph"][0]["@type"], "TouristTrip")
+            self.assertTrue(str(data["@graph"][0].get("image", "")).startswith("https://"))
+            with open(disk, encoding="utf-8") as handle:
+                saved = handle.read()
+            self.assertIn(app.ENHANCED_MARKER, saved)
+            self.assertIn('class="hero-photo"', saved)
+
+            calls_after = len(WIKI_CALLS)
+            self.assertGreater(calls_after, 0)
+            app._page_mem.clear()
+            repeat_legacy = self.client.get("/pages/lisbon-pet-friendly")
+            repeat_disk = self.client.get("/pages/old-lisbon-weekend.html")
+            self.assertEqual(repeat_legacy.status_code, 200)
+            self.assertEqual(repeat_disk.status_code, 200)
+            self.assertEqual(len(WIKI_CALLS), calls_after)
+            self.assertEqual(repeat_disk.text.count('id="related-trips"'), 1)
+            self.assertIn("Assemble the perfect Trip", repeat_legacy.text)
+
+            sitemap = self.client.get("/sitemap.xml")
+            self.assertEqual(sitemap.status_code, 200)
+            self.assertIn("lisbon-pet-friendly", sitemap.text)
+            self.assertIn("old-lisbon-weekend", sitemap.text)
+            section = disk_response.text.split('id="related-trips"', 1)[1]
+            for link in re.findall(r'href="/pages/([^"]+)\.html"', section)[:3]:
+                self.assertIn(link, sitemap.text)
+            health = self.client.get("/healthz")
+            self.assertEqual(health.status_code, 200)
+            self.assertEqual(health.text, "ok")
+        finally:
+            app.LEGACY_DIR = original_legacy
+            app._catalog["key"] = None
+            app._catalog["items"] = []
+            shutil.rmtree(legacy_dir, ignore_errors=True)
+
+    def test_image_lookup_failure_serves_original(self):
+        disk = os.path.join(os.environ["PAGES_DIR"], "old-porto-notes.html")
+        original = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Old Porto notes | TripAssembler</title></head>
+<body>
+<header><a class="brand" href="/"><h1>TripAssembler</h1></a></header>
+<div class="container">
+  <h2>Old Porto notes</h2>
+  <p>Assemble the perfect stay</p>
+  <p>The cellars are still in this page.</p>
+  <div class="actions"><button>Print</button></div>
+</div>
+<footer>TripAssembler</footer>
+</body></html>
+"""
+        with open(disk, "w", encoding="utf-8") as handle:
+            handle.write(original)
+
+        async def explode(specs, timeout=8.0):
+            raise RuntimeError("wiki down")
+
+        original_resolve = app.resolve_images
+        app.resolve_images = explode
+        try:
+            response = self.client.get("/pages/old-porto-notes")
+        finally:
+            app.resolve_images = original_resolve
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Old Porto notes", response.text)
+        self.assertIn("The cellars are still in this page.", response.text)
+        self.assertIn("Assemble the perfect Trip", response.text)
+        self.assertNotIn("perfect stay", response.text.lower())
+        self.assertNotIn("hero-photo", response.text)
+        self.assertNotIn("wiki down", response.text)
+        self.assertNotIn("Traceback", response.text)
+        with open(disk, encoding="utf-8") as handle:
+            self.assertNotIn(app.ENHANCED_MARKER, handle.read())
+
+        WIKI_MODE["empty"] = True
+        WIKI_CALLS.clear()
+        app._page_mem.clear()
+        missed = self.client.get("/pages/old-porto-notes")
+        self.assertEqual(missed.status_code, 200)
+        self.assertIn("The cellars are still in this page.", missed.text)
+        self.assertNotIn('class="hero-photo"', missed.text)
+        self.assertNotIn('src=""', missed.text)
+        self.assertIn('id="related-trips"', missed.text)
+        self.assertIn("Assemble the perfect Trip", missed.text)
+        calls_after = len(WIKI_CALLS)
+        app._page_mem.clear()
+        self.client.get("/pages/old-porto-notes")
+        self.assertEqual(len(WIKI_CALLS), calls_after)
 
 
 if __name__ == "__main__":
