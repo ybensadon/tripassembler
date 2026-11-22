@@ -2,7 +2,7 @@ from fastapi import FastAPI, Form
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.middleware.gzip import GZipMiddleware
 from openai import AsyncOpenAI
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 import asyncio
 import hashlib
 import html
@@ -54,6 +54,18 @@ _IMAGE_POSITIVE_TTL = 30 * 24 * 3600
 _IMAGE_NEGATIVE_TTL = 6 * 3600
 _image_cache = {}
 _cache_loaded = False
+
+# Served pages (legacy files and older generated HTML) get one pass that adds
+# photos, related trips, and the current tagline. The marker makes that pass idempotent.
+TAGLINE = "Assemble the perfect Trip"
+ENHANCED_MARKER = "<!-- ta-enhanced -->"
+ENHANCE_TIMEOUT = 6.0
+RELATED_LIMIT = 6
+_page_mem = {}
+_page_locks = {}
+_catalog = {"key": None, "items": []}
+_popular_slugs = None
+_OLD_TAGLINE_RE = re.compile(r"Assemble the perfect stay", re.I)
 
 _TOKEN_RE = re.compile(r"%%[A-Z_]+%%")
 _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,180}")
@@ -450,7 +462,13 @@ def _parse_query(data):
     pages = (data.get("query") or {}).get("pages") or {}
     if not isinstance(pages, dict):
         return None
-    for page in pages.values():
+    # generator=search includes an index. Page ids are not relevance order, and the
+    # top hit often has no thumbnail (a list or a disambiguation).
+    ordered = sorted(
+        (page for page in pages.values() if isinstance(page, dict)),
+        key=lambda page: page.get("index") if isinstance(page.get("index"), int) else 0,
+    )
+    for page in ordered:
         if not isinstance(page, dict) or "missing" in page:
             continue
         thumb = page.get("thumbnail") or {}
@@ -466,9 +484,9 @@ def _parse_query(data):
     return None
 
 
-def wiki_client():
+def wiki_client(timeout=3.0):
     return httpx.AsyncClient(
-        timeout=httpx.Timeout(3.0, connect=2.0),
+        timeout=httpx.Timeout(timeout, connect=2.0),
         headers={
             "User-Agent": WIKI_UA,
             "Api-User-Agent": WIKI_UA,
@@ -479,16 +497,25 @@ def wiki_client():
 
 
 async def _get_json(http, url, params=None):
-    try:
-        response = await http.get(url, params=params)
-    except httpx.HTTPError:
-        return None
-    if response.status_code != 200:
-        return None
-    try:
-        return response.json()
-    except ValueError:
-        return None
+    for _attempt in range(4):
+        try:
+            response = await http.get(url, params=params)
+        except httpx.HTTPError:
+            return None
+        if response.status_code in {429, 503}:
+            try:
+                wait = min(float(response.headers.get("retry-after") or 2), 12)
+            except ValueError:
+                wait = 2.0
+            await asyncio.sleep(max(wait, 1.0))
+            continue
+        if response.status_code != 200:
+            return None
+        try:
+            return response.json()
+        except ValueError:
+            return None
+    return None
 
 
 async def fetch_by_title(http, title):
@@ -527,7 +554,7 @@ async def fetch_search(http, query):
         "action": "query",
         "generator": "search",
         "gsrsearch": query,
-        "gsrlimit": "1",
+        "gsrlimit": "5",
         "prop": "pageimages|info",
         "inprop": "url",
         "pithumbsize": "640",
@@ -550,6 +577,510 @@ async def lookup_image(http, wiki_title="", query=""):
         if search_for and (not title or search_for.casefold() != title.casefold()):
             image = await fetch_search(http, search_for)
     return image
+
+
+# Maps, flags, logos, and icons are not trip photos. Match the file name, not the city name.
+_BAD_PHOTO = re.compile(
+    r"(flag[_ -]?of|(^|[_ -])flag([_ .-]|$)|logo|(^|[_ -])icon([_ .-]|$)|"
+    r"locator|(^|[_ -])map([_ .-]|$)|map[_ -]of|coat[_ -]?of[_ -]?arms|"
+    r"(^|[_ -])seal([_ .-]|$)|emblem|wordmark|pictogram|(^|[_ -])symbol([_ .-]|$)|"
+    r"(^|[_ -])badge([_ .-]|$)|diagram|location[_ -]?map|relief[_ -]?map|orthographic|opentopo|topographic)",
+    re.I,
+)
+_ARTICLE_TITLES = {
+    "cancun": "Cancún",
+    "new york": "New York City",
+    "split": "Split, Croatia",
+}
+_THEME_WORDS = {
+    "pet-friendly": "park",
+    "family": "park",
+    "beach": "beach",
+    "nature": "nature",
+    "walkable": "street",
+    "romantic": "evening",
+    "luxury": "architecture",
+    "pool": "architecture",
+    "kitchen": "market",
+    "budget": "neighborhood",
+}
+_LANDMARK_WORDS = (
+    "canal", "canals", "beach", "harbor", "harbour", "mountain", "ocean",
+    "museum", "palace", "temple", "market", "garden", "bridge", "castle",
+    "skyline", "waterfront", "old town", "cathedral", "mosque", "park",
+)
+_assignments = None
+_assign_lock = None
+
+
+def assignment_path():
+    """Persistent record of which photo each page was given. Lives on the page disk."""
+    override = os.getenv("WIKI_ASSIGNMENTS")
+    if override:
+        return override
+    return os.path.join(PAGES_DIR, ".image-assignments.json")
+
+
+def load_assignments():
+    global _assignments
+    if _assignments is not None:
+        return _assignments
+    _assignments = {}
+    try:
+        with open(assignment_path(), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return _assignments
+    if isinstance(data, dict):
+        _assignments = data
+    return _assignments
+
+
+def save_assignments():
+    if _assignments is None:
+        return
+    try:
+        write_text_atomic(assignment_path(), json.dumps(_assignments))
+    except OSError:
+        log.warning("could not persist image assignments", exc_info=True)
+
+
+def reset_assignments():
+    global _assignments
+    _assignments = {}
+    try:
+        os.remove(assignment_path())
+    except OSError:
+        pass
+
+
+def commons_filename(src):
+    """Original file name inside a Wikimedia thumbnail or file URL."""
+    path = unquote(urlparse(str(src or "")).path)
+    chosen = ""
+    for part in (piece for piece in path.split("/") if piece):
+        if re.search(r"\.(?:jpe?g|png|gif|svg|webp|tiff?)$", part, re.I) and not re.match(r"^\d+px-", part, re.I):
+            chosen = part
+    if not chosen:
+        tail = path.rsplit("/", 1)[-1]
+        chosen = re.sub(r"^\d+px-", "", tail)
+    return chosen
+
+
+def photo_file_key(src):
+    return commons_filename(src).casefold()
+
+
+def is_real_photo(src, title=""):
+    """Keep JPEG photographs. Drop maps, flags, logos, icons, and SVG."""
+    name = commons_filename(src) or str(title or "")
+    blob = name.replace("_", " ")
+    if not re.search(r"\.jpe?g$", name, re.I):
+        return False
+    lowered = f"{src or ''} {title or ''}".casefold()
+    if ".svg" in lowered or lowered.endswith(".svg"):
+        return False
+    if _BAD_PHOTO.search(blob):
+        return False
+    return True
+
+
+def _ordered_pages(data):
+    pages = ((data or {}).get("query") or {}).get("pages") or {}
+    if not isinstance(pages, dict):
+        return []
+    return sorted(
+        (page for page in pages.values() if isinstance(page, dict)),
+        key=lambda page: page.get("index") if isinstance(page.get("index"), int) else 0,
+    )
+
+
+def _collect_thumbs(data):
+    found = []
+    seen = set()
+    for page in _ordered_pages(data):
+        if "missing" in page:
+            continue
+        thumb = page.get("thumbnail") or {}
+        image = _wiki_image(
+            thumb.get("source"),
+            thumb.get("width"),
+            thumb.get("height"),
+            page.get("fullurl"),
+            page.get("title"),
+        )
+        if not image or not is_real_photo(image["src"], image.get("title") or ""):
+            continue
+        key = photo_file_key(image["src"])
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        image["file"] = key
+        found.append(image)
+    return found
+
+
+async def fetch_search_pool(http, query, limit=8):
+    """Several photographed search hits, in relevance order."""
+    data = await _get_json(http, WIKI_API, {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrlimit": str(limit),
+        "prop": "pageimages|info",
+        "inprop": "url",
+        "pithumbsize": "640",
+        "format": "json",
+    })
+    return _collect_thumbs(data)
+
+
+def mentions_place(text, city):
+    """True when the city name appears as whole words, in order."""
+    tokens = re.findall(r"[a-z0-9]+", str(text or "").casefold())
+    city_tokens = re.findall(r"[a-z0-9]+", str(city or "").casefold())
+    if not tokens or not city_tokens:
+        return False
+    width = len(city_tokens)
+    return any(tokens[index:index + width] == city_tokens for index in range(len(tokens) - width + 1))
+
+
+def _https_url(src):
+    src = str(src or "").strip()
+    if src.startswith("//"):
+        return "https:" + src
+    return src
+
+
+async def fetch_displayed_photos(http, title, limit=16):
+    """JPEG pictures actually shown on the English Wikipedia article."""
+    article = str(title or "").strip().replace(" ", "_")
+    if not article:
+        return []
+    data = await _get_json(
+        http,
+        "https://en.wikipedia.org/api/rest_v1/page/media-list/" + quote(article, safe=""),
+    )
+    names = []
+    for item in (data or {}).get("items") or []:
+        if not isinstance(item, dict) or item.get("type") != "image":
+            continue
+        name = str(item.get("title") or "")
+        if not re.search(r"\.jpe?g$", name, re.I):
+            continue
+        if _BAD_PHOTO.search(name.replace("_", " ")):
+            continue
+        names.append(name if name.lower().startswith("file:") else "File:" + name)
+    # Preserve on-page order, then keep a stable unique list.
+    unique = []
+    seen_names = set()
+    for name in names:
+        key = name.casefold()
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        unique.append(name)
+    unique = unique[:limit]
+    if not unique:
+        return []
+    found = []
+    seen = set()
+    for start in range(0, len(unique), 8):
+        info = await _get_json(http, WIKI_API, {
+            "action": "query",
+            "titles": "|".join(unique[start:start + 8]),
+            "prop": "imageinfo",
+            "iiprop": "url|mime",
+            "iiurlwidth": "640",
+            "format": "json",
+        })
+        for page in _ordered_pages(info):
+            # Commons files are "missing" on en.wikipedia but still include imageinfo.
+            meta = (page.get("imageinfo") or [None])[0]
+            if not isinstance(meta, dict) or str(meta.get("mime") or "").lower() != "image/jpeg":
+                continue
+            label = str(page.get("title") or "").replace("_", " ")
+            if label.lower().startswith("file:"):
+                label = label[5:]
+            image = _wiki_image(
+                _https_url(meta.get("thumburl") or meta.get("url")),
+                meta.get("thumbwidth") or meta.get("width"),
+                meta.get("thumbheight") or meta.get("height"),
+                meta.get("descriptionurl"),
+                label,
+            )
+            if not image or not is_real_photo(image["src"], label):
+                continue
+            key = photo_file_key(image["src"])
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            image["file"] = key
+            found.append(image)
+    return found
+
+
+async def fetch_article_photos(http, title, limit=24):
+    """JPEG files embedded on the city article, with file-page attribution."""
+    data = await _get_json(http, WIKI_API, {
+        "action": "query",
+        "titles": title,
+        "prop": "images",
+        "imlimit": "max",
+        "redirects": "1",
+        "format": "json",
+    })
+    files = []
+    for page in _ordered_pages(data):
+        for item in page.get("images") or []:
+            name = str(item.get("title") or "")
+            if not re.search(r"\.jpe?g$", name, re.I):
+                continue
+            if _BAD_PHOTO.search(name.replace("_", " ")):
+                continue
+            files.append(name)
+    files = files[:limit]
+    if not files:
+        return []
+    found = []
+    seen = set()
+    merged_pages = []
+    for start in range(0, len(files), 8):
+        info = await _get_json(http, WIKI_API, {
+            "action": "query",
+            "titles": "|".join(files[start:start + 8]),
+            "prop": "imageinfo",
+            "iiprop": "url|mime",
+            "iiurlwidth": "640",
+            "format": "json",
+        })
+        merged_pages.extend(_ordered_pages(info))
+    for page in merged_pages:
+        if "missing" in page:
+            continue
+        meta = (page.get("imageinfo") or [None])[0]
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("mime") or "").lower() != "image/jpeg":
+            continue
+        label = str(page.get("title") or "").replace("_", " ")
+        if label.lower().startswith("file:"):
+            label = label[5:]
+        image = _wiki_image(
+            meta.get("thumburl") or meta.get("url"),
+            meta.get("thumbwidth") or meta.get("width"),
+            meta.get("thumbheight") or meta.get("height"),
+            meta.get("descriptionurl"),
+            label,
+        )
+        if not image or not is_real_photo(image["src"], label):
+            continue
+        key = photo_file_key(image["src"])
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        image["file"] = key
+        found.append(image)
+    return found
+
+
+def pool_queries(info):
+    """City search plus landmarks and themes named by this page."""
+    city = (info.get("city") or "").strip()
+    if not city:
+        text = info.get("query") or info.get("title") or ""
+        return [text] if text else []
+    queries = [city]
+    country = (info.get("country") or "").strip()
+    if country and country.casefold() != city.casefold():
+        queries.append(f"{city}, {country}")
+    if city.casefold() == "new york":
+        queries.append("New York City")
+    blob = f"{info.get('title', '')} {(info.get('slug') or '').replace('-', ' ')}".casefold()
+    extras = []
+    for theme in info.get("themes") or []:
+        word = _THEME_WORDS.get(theme)
+        if word and word not in extras:
+            extras.append(word)
+    for word in _LANDMARK_WORDS:
+        if word in blob and word not in extras:
+            extras.append(word)
+    for word in extras[:4]:
+        queries.append(f"{word} {city}")
+    unique = []
+    seen = set()
+    for query in queries:
+        key = query.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(query)
+    return unique[:6]
+
+
+def location_key(info):
+    city = (info.get("city") or "").strip().casefold()
+    country = (info.get("country") or "").strip().casefold()
+    if not city:
+        return ""
+    return city + "|" + country
+
+
+def slug_offset(slug, size):
+    if size <= 0:
+        return 0
+    digest = hashlib.sha256(str(slug or "").encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % size
+
+
+def choose_distinct(slug, pool, taken_files):
+    """Hash the slug into the pool, then walk forward to a photo nobody else has."""
+    usable = [image for image in pool or [] if image.get("file") and image.get("src")]
+    if not usable:
+        return None
+    start = slug_offset(slug, len(usable))
+    for step in range(len(usable)):
+        image = usable[(start + step) % len(usable)]
+        if image["file"] not in taken_files:
+            return image
+    return usable[start]
+
+
+def merge_pool(existing, extra):
+    merged = list(existing or [])
+    seen = {image.get("file") for image in merged if image.get("file")}
+    for image in extra or []:
+        key = image.get("file")
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(image)
+    return merged
+
+
+async def build_location_pool(info, extra_queries=None, timeout=6.0):
+    queries = list(pool_queries(info))
+    seen_queries = {query.casefold() for query in queries}
+    for query in extra_queries or []:
+        text = " ".join(str(query or "").split())
+        if text and text.casefold() not in seen_queries:
+            seen_queries.add(text.casefold())
+            queries.append(text)
+    queries = [query for query in queries if query][:4]
+    city = (info.get("city") or "").strip()
+    images = []
+    seen = set()
+
+    def add(batch):
+        for image in batch or []:
+            key = image.get("file") or photo_file_key(image.get("src"))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            image["file"] = key
+            images.append(image)
+
+    try:
+        async with wiki_client(timeout=max(float(timeout or 8), 8)) as http:
+            # Pictures shown on the city article, then a name-matched search if that set is short.
+            article = _ARTICLE_TITLES.get(city.casefold(), city) if city else ""
+            if article:
+                add(await fetch_displayed_photos(http, article))
+            if len(images) < 8 and city and article.casefold() != city.casefold():
+                add(await fetch_displayed_photos(http, city))
+            if len(images) < 4 and article:
+                add(await fetch_article_photos(http, article))
+            if len(images) < 8:
+                for query in queries:
+                    if len(images) >= 12:
+                        break
+                    for image in await fetch_search_pool(http, query):
+                        blob = f"{image.get('title') or ''} {image.get('file') or ''}"
+                        if city and not mentions_place(blob, city):
+                            continue
+                        add([image])
+    except Exception:
+        log.warning("location image pool failed", exc_info=True)
+    images.sort(key=lambda image: image.get("file") or "")
+    return images
+
+
+def _assignment_lock():
+    global _assign_lock
+    if _assign_lock is None:
+        _assign_lock = asyncio.Lock()
+    return _assign_lock
+
+
+async def assign_hero_image(info, avoid_files=None, timeout=6.0, extra_queries=None):
+    """Give this slug a photo of its city that other pages of that city are not using."""
+    slug = info.get("slug") or ""
+    loc = location_key(info)
+    if not slug or not loc:
+        return None
+    avoid = {key for key in (avoid_files or set()) if key}
+    store = load_assignments()
+    bucket = store.get(loc)
+    if not isinstance(bucket, dict):
+        bucket = {"pool": [], "assigned": {}}
+    pool = [image for image in (bucket.get("pool") or []) if isinstance(image, dict)]
+    assigned = bucket.get("assigned") if isinstance(bucket.get("assigned"), dict) else {}
+    current = assigned.get(slug)
+    if isinstance(current, dict) and current.get("src"):
+        current_key = current.get("file") or photo_file_key(current.get("src"))
+        if current_key and current_key not in avoid:
+            remember_image(current, slug)
+            return current
+    if not pool or extra_queries:
+        built = await build_location_pool(info, extra_queries=extra_queries, timeout=timeout)
+        pool = merge_pool(pool, built)
+    if not pool:
+        return None
+    async with _assignment_lock():
+        store = load_assignments()
+        bucket = store.get(loc)
+        if not isinstance(bucket, dict):
+            bucket = {"pool": [], "assigned": {}}
+        assigned = bucket.get("assigned") if isinstance(bucket.get("assigned"), dict) else {}
+        current = assigned.get(slug)
+        if isinstance(current, dict) and current.get("src"):
+            current_key = current.get("file") or photo_file_key(current.get("src"))
+            if current_key and current_key not in avoid:
+                remember_image(current, slug)
+                return current
+        pool = merge_pool(bucket.get("pool") or [], pool)
+        taken = set(avoid)
+        for other, image in assigned.items():
+            if other == slug or not isinstance(image, dict):
+                continue
+            key = image.get("file") or photo_file_key(image.get("src"))
+            if key:
+                taken.add(key)
+        image = choose_distinct(slug, pool, taken)
+        if not image:
+            return None
+        assigned[slug] = image
+        bucket["pool"] = pool
+        bucket["assigned"] = assigned
+        store[loc] = bucket
+        save_assignments()
+    remember_image(image, slug)
+    return image
+
+
+def assigned_image(slug):
+    """The photo already chosen for a page, from memory or the on-disk assignment file."""
+    if not slug:
+        return None
+    image, hit = cache_get("slug:" + slug.casefold())
+    if hit and isinstance(image, dict) and image.get("src"):
+        return image
+    store = load_assignments()
+    for bucket in store.values():
+        if not isinstance(bucket, dict):
+            continue
+        found = (bucket.get("assigned") or {}).get(slug)
+        if isinstance(found, dict) and found.get("src"):
+            return found
+    return None
 
 
 def image_cache_key(wiki_title, query):
@@ -595,6 +1126,29 @@ def _save_image_cache():
         log.warning("could not persist wikipedia image cache", exc_info=True)
 
 
+def remember_image(image, slug="", *labels):
+    """Keep a positive hit under a page slug and plain-text place names."""
+    if not isinstance(image, dict) or not image.get("src"):
+        return
+    _load_image_cache()
+    now = time.time()
+    changed = False
+    if slug and _SLUG_RE.fullmatch(slug):
+        _image_cache["slug:" + slug.casefold()] = {"at": now, "image": image}
+        changed = True
+    for label in labels:
+        key = image_cache_key("", label)
+        if not key:
+            continue
+        existing = _image_cache.get(key)
+        if isinstance(existing, dict) and existing.get("image"):
+            continue
+        _image_cache[key] = {"at": now, "image": image}
+        changed = True
+    if changed:
+        _save_image_cache()
+
+
 def cache_get(key):
     _load_image_cache()
     item = _image_cache.get(key)
@@ -608,7 +1162,7 @@ def cache_get(key):
     return item.get("image"), True
 
 
-async def resolve_images(specs):
+async def resolve_images(specs, timeout=8.0):
     """Look up many images at once. Each call is capped; the whole batch is capped too."""
     _load_image_cache()
     results = {}
@@ -657,7 +1211,7 @@ async def resolve_images(specs):
                     return await one(http, cache_key)
 
             tasks = [asyncio.create_task(limited(cache_key)) for cache_key in pending]
-            done, not_done = await asyncio.wait(tasks, timeout=8.0)
+            done, not_done = await asyncio.wait(tasks, timeout=timeout)
             for task in not_done:
                 task.cancel()
             for task in not_done:
@@ -682,12 +1236,20 @@ async def resolve_images(specs):
     return results
 
 
-async def attach_images(assembly, records):
+def _without_used_photo(image, used):
+    """Skip a photo this page already shows, unless it is the only one we found."""
+    if not isinstance(image, dict) or not image.get("src"):
+        return None
+    key = image.get("file") or photo_file_key(image.get("src"))
+    if key and key in used:
+        return None
+    if key:
+        used.add(key)
+    return image
+
+
+async def attach_images(assembly, records, slug=""):
     specs = []
-    hero_wiki = opt_text(assembly.get("wiki_title"), 120)
-    location = opt_text(assembly.get("location"), 160)
-    if hero_wiki or location:
-        specs.append(("hero", hero_wiki, hero_wiki or location))
     for index, record in enumerate(records[:8]):
         wiki = opt_text(record.get("wiki_title"), 120)
         label = record.get("label") or ""
@@ -705,15 +1267,62 @@ async def attach_images(assembly, records):
     except Exception:
         log.warning("image attachment failed", exc_info=True)
         found = {}
-    if found.get("hero"):
-        assembly["hero_image"] = found["hero"]
+    stop_files = set()
     for index, record in enumerate(records[:8]):
         image = found.get(f"stop:{index}")
-        if image:
-            record["image"] = image
+        if not isinstance(image, dict) or not image.get("src"):
+            continue
+        key = image.get("file") or photo_file_key(image.get("src"))
+        if key and key in stop_files:
+            continue
+        if key:
+            stop_files.add(key)
+        record["image"] = image
+    title = str(assembly.get("title") or "").strip()
+    location = opt_text(assembly.get("location"), 160)
+    info = describe_trip(slug, title, location)
+    hero = None
+    if slug and location_key(info):
+        try:
+            hero = await assign_hero_image(info, avoid_files=stop_files)
+        except Exception:
+            log.warning("unique hero failed", exc_info=True)
+            hero = None
+    if not hero:
+        hero_wiki = opt_text(assembly.get("wiki_title"), 120)
+        try:
+            fallback = await resolve_images([("hero", hero_wiki, hero_wiki or location or title)])
+        except Exception:
+            fallback = {}
+        hero = fallback.get("hero")
+        hero_key = photo_file_key(hero.get("src")) if isinstance(hero, dict) else ""
+        if hero_key and hero_key in stop_files:
+            hero = None
+        elif hero and slug:
+            remember_image(hero, slug)
+    if hero:
+        assembly["hero_image"] = hero
+        hero_key = hero.get("file") or photo_file_key(hero.get("src"))
+    else:
+        hero_key = ""
     for index, day in enumerate(itinerary):
-        if isinstance(day, dict) and found.get(f"day:{index}"):
-            day["image"] = found[f"day:{index}"]
+        if not isinstance(day, dict):
+            continue
+        image = found.get(f"day:{index}")
+        if not isinstance(image, dict) or not image.get("src"):
+            continue
+        key = image.get("file") or photo_file_key(image.get("src"))
+        if key and key == hero_key:
+            continue
+        day["image"] = image
+    if hero_key:
+        for record in records[:8]:
+            image = record.get("image")
+            if not isinstance(image, dict):
+                continue
+            key = image.get("file") or photo_file_key(image.get("src"))
+            if key == hero_key:
+                record.pop("image", None)
 
 
 def photo_figure(image, alt, css_class):
@@ -743,6 +1352,37 @@ def photo_figure(image, alt, css_class):
     )
 
 
+def stop_li_html(label, image=None):
+    """One route stop, with a Wikipedia thumbnail when we have one."""
+    maps = "https://www.google.com/maps/search/?api=1&query=" + encode_place(label)
+    thumb = ""
+    attr = ""
+    if isinstance(image, dict):
+        src = safe_url(image.get("src"))
+        if src:
+            try:
+                width = int(image.get("width") or 640)
+                height = int(image.get("height") or 480)
+            except (TypeError, ValueError):
+                width, height = 640, 480
+            thumb = (
+                f'<img class="stop-thumb" src="{src}" width="{width}" height="{height}" '
+                f'alt="{esc(image.get("title") or label)}" loading="lazy" decoding="async">'
+            )
+            page = safe_url(image.get("page"))
+            if page:
+                attr = (
+                    f'<div class="wiki-attr-line"><a href="{page}" target="_blank" '
+                    f'rel="noopener noreferrer">{esc(image.get("title") or label)}</a>'
+                    f" · Wikipedia</div>"
+                )
+    return (
+        f'<li class="stop">{thumb}<div class="stop-body">'
+        f'<a href="{html.escape(maps, quote=True)}" target="_blank" rel="noopener noreferrer">{esc(label)}</a>'
+        f"{attr}</div></li>"
+    )
+
+
 def map_block_html(records, location, map_url, open_url):
     items = []
     for record in records:
@@ -754,33 +1394,7 @@ def map_block_html(records, location, map_url, open_url):
             image = None
         if not label:
             continue
-        maps = "https://www.google.com/maps/search/?api=1&query=" + encode_place(label)
-        thumb = ""
-        attr = ""
-        if isinstance(image, dict):
-            src = safe_url(image.get("src"))
-            if src:
-                try:
-                    width = int(image.get("width") or 640)
-                    height = int(image.get("height") or 480)
-                except (TypeError, ValueError):
-                    width, height = 640, 480
-                thumb = (
-                    f'<img class="stop-thumb" src="{src}" width="{width}" height="{height}" '
-                    f'alt="{esc(image.get("title") or label)}" loading="lazy" decoding="async">'
-                )
-                page = safe_url(image.get("page"))
-                if page:
-                    attr = (
-                        f'<div class="wiki-attr-line"><a href="{page}" target="_blank" '
-                        f'rel="noopener noreferrer">{esc(image.get("title") or label)}</a>'
-                        f" · Wikipedia</div>"
-                    )
-        items.append(
-            f'<li class="stop">{thumb}<div class="stop-body">'
-            f'<a href="{html.escape(maps, quote=True)}" target="_blank" rel="noopener noreferrer">{esc(label)}</a>'
-            f"{attr}</div></li>"
-        )
+        items.append(stop_li_html(label, image))
     stops_html = f'<ol class="stops">{"".join(items)}</ol>' if items else ""
     iframe = ""
     if map_url:
@@ -857,26 +1471,9 @@ def itinerary_to_html(itinerary):
     return "".join(parts)
 
 
-def related_to_html(index, slug, location, limit=5):
-    others = [item for item in index if item.get("slug") != slug]
-    loc = (location or "").strip().casefold()
-    if loc and loc not in {"see request", "travel"}:
-        scored = []
-        for item in others:
-            item_loc = str(item.get("location", "")).casefold()
-            title = str(item.get("title", "")).casefold()
-            if loc in item_loc or loc in title or (item_loc and item_loc in loc):
-                scored.append(item)
-        others = scored or others
-    others = others[:limit]
-    if not others:
-        return ""
-    items = "".join(
-        f'<li><a href="/pages/{esc(item["slug"])}.html">{esc(item.get("title", "Trip"))}</a></li>'
-        for item in others
-        if item.get("slug")
-    )
-    return f"<h2>More trip assemblies</h2><ul>{items}</ul>" if items else ""
+def related_to_html(index, slug, location, limit=RELATED_LIMIT, title=""):
+    """Related-trip cards. `index` is unused; the pool is legacy pages plus index.json."""
+    return related_section_html(slug, title, location, limit=limit)
 
 
 def build_json_ld(page_url, title, summary, location, itinerary, faqs, image_url=""):
@@ -1108,7 +1705,8 @@ def page_shell(title, body_html, head_extra="", script=""):
         + (head_extra or "")
         + "</head>\n<body>\n<header><a class=\"brand\" href=\"/\">"
         + BRAND_SVG
-        + "<h1>TripAssembler</h1></a></header>\n"
+        + '<span class="brand-lockup"><h1>TripAssembler</h1>'
+        + f'<p class="brand-tag">{TAGLINE}</p></span></a></header>\n'
         + body_html
         + '\n<footer>TripAssembler · Custom assemblies for real travel constraints · '
         + '<a href="/sitemap.xml">Sitemap</a></footer>\n'
@@ -1232,7 +1830,7 @@ PAGE_TEMPLATE = """
   <path d="M8 22 L18 10 L28 22" stroke="white" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
   <circle cx="18" cy="24" r="2" fill="white"/>
 </svg>
-    <h1>TripAssembler</h1>
+    <span class="brand-lockup"><h1>TripAssembler</h1><p class="brand-tag">Assemble the perfect Trip</p></span>
   </a>
 </header>
 <div class="container">
@@ -1275,17 +1873,19 @@ PAGE_TEMPLATE = """
   </div>
 </div>
 <footer>TripAssembler · Custom assemblies for real travel constraints · <a href="/sitemap.xml">Sitemap</a></footer>
+<!-- ta-enhanced -->
 </body>
 </html>
 """
 
 
-def persist_assembly(assembly, records):
-    created_at = datetime.now(timezone.utc)
-    stamp = created_at.strftime("%Y%m%d%H%M")
+def persist_assembly(assembly, records, slug="", created_at=None):
+    created_at = created_at or datetime.now(timezone.utc)
     title = str(assembly.get("title") or "").strip() or "Your trip assembly"
     location = str(assembly.get("location") or "").strip()
-    slug = f"{slugify(title)}-{stamp}-{secrets.token_hex(2)}"
+    if not slug:
+        stamp = created_at.strftime("%Y%m%d%H%M")
+        slug = f"{slugify(title)}-{stamp}-{secrets.token_hex(2)}"
 
     labels = [record["label"] for record in records]
     map_url, open_url = build_map_urls(labels, location)
@@ -1301,9 +1901,9 @@ def persist_assembly(assembly, records):
         faqs_html = f'<div class="card">{faqs_html}</div>'
 
     index = load_index()
-    related_html = related_to_html(index, slug, location)
-    if related_html:
-        related_html = f'<div class="card">{related_html}</div>'
+    related_html = related_to_html(index, slug, location, title=title)
+    if isinstance(assembly.get("hero_image"), dict):
+        remember_image(assembly.get("hero_image"), slug, location, title)
 
     page_url = f"{BASE_URL}/pages/{slug}.html"
     summary = assembly.get("summary", "")
@@ -1394,8 +1994,11 @@ async def run_job(job_id, request_text):
     try:
         assembly = await generate_assembly(request_text)
         records = _clean_records(assembly.get("map_places"), assembly.get("location") or "")
-        await attach_images(assembly, records)
-        job["redirect"] = persist_assembly(assembly, records)
+        title = str(assembly.get("title") or "").strip() or "Your trip assembly"
+        created_at = datetime.now(timezone.utc)
+        slug = f"{slugify(title)}-{created_at.strftime('%Y%m%d%H%M')}-{secrets.token_hex(2)}"
+        await attach_images(assembly, records, slug=slug)
+        job["redirect"] = persist_assembly(assembly, records, slug=slug, created_at=created_at)
         job["status"] = "done"
     except Exception:
         log.exception("assembly job %s failed", job_id)
@@ -1615,6 +2218,706 @@ async def styles_css(v: str = ""):
     return FileResponse(STYLES_PATH, media_type="text/css", headers={"Cache-Control": cache})
 
 
+# City -> (country, region) for legacy slugs, whose titles name a place but not a country.
+PLACE_META = {
+    "amsterdam": ("Netherlands", "Europe"),
+    "athens": ("Greece", "Europe"),
+    "bali": ("Indonesia", "Asia"),
+    "banff": ("Canada", "North America"),
+    "bangkok": ("Thailand", "Asia"),
+    "barcelona": ("Spain", "Europe"),
+    "budapest": ("Hungary", "Europe"),
+    "cancun": ("Mexico", "North America"),
+    "cape town": ("South Africa", "Africa"),
+    "dubai": ("United Arab Emirates", "Middle East"),
+    "dubrovnik": ("Croatia", "Europe"),
+    "iceland": ("Iceland", "Europe"),
+    "reykjavik": ("Iceland", "Europe"),
+    "kyoto": ("Japan", "Asia"),
+    "lisbon": ("Portugal", "Europe"),
+    "london": ("United Kingdom", "Europe"),
+    "los angeles": ("United States", "North America"),
+    "maldives": ("Maldives", "Asia"),
+    "marrakech": ("Morocco", "Africa"),
+    "maui": ("United States", "North America"),
+    "miami": ("United States", "North America"),
+    "mykonos": ("Greece", "Europe"),
+    "new york": ("United States", "North America"),
+    "oahu": ("United States", "North America"),
+    "osaka": ("Japan", "Asia"),
+    "paris": ("France", "Europe"),
+    "phuket": ("Thailand", "Asia"),
+    "prague": ("Czechia", "Europe"),
+    "rome": ("Italy", "Europe"),
+    "santorini": ("Greece", "Europe"),
+    "singapore": ("Singapore", "Asia"),
+    "split": ("Croatia", "Europe"),
+    "sydney": ("Australia", "Oceania"),
+    "tokyo": ("Japan", "Asia"),
+    "tulum": ("Mexico", "North America"),
+    "vienna": ("Austria", "Europe"),
+}
+_PLACE_KEYS = tuple(sorted(PLACE_META, key=len, reverse=True))
+_THEMES = (
+    ("pet-friendly", ("pet-friendly", "pet friendly", "pets")),
+    ("family", ("family", "kids")),
+    ("budget", ("budget", "under-200", "under $200", "under 200")),
+    ("beach", ("beach",)),
+    ("luxury", ("luxury", "ocean view", "ocean-view")),
+    ("pool", ("pool",)),
+    ("walkable", ("walkable", "city center", "city-center")),
+    ("romantic", ("romantic", "quiet")),
+    ("nature", ("mountain", "nature")),
+    ("kitchen", ("kitchen",)),
+)
+_GENERIC_DAY = re.compile(
+    r"^(theme|explore|exploring|free day|arrival|departure|travel day|rest day|rest|day\s+\d+)$",
+    re.I,
+)
+_PAGE_ICON_RE = re.compile(r"\s*<div class=\"page-icon\">.*?</div>", re.S | re.I)
+_TITLE_BLOCK_RE = re.compile(
+    r"<h2\b[^>]*>.*?</h2>(\s*<p\b[^>]*>.*?</p>)?",
+    re.S | re.I,
+)
+_OLD_RELATED_RE = re.compile(
+    r"\s*(?:<div class=\"card\">\s*)?<h2>\s*More trip assemblies\s*</h2>\s*<ul>.*?</ul>\s*(?:</div>)?",
+    re.I | re.S,
+)
+_BRAND_LOCKUP = (
+    '<span class="brand-lockup"><h1>TripAssembler</h1>'
+    f'<p class="brand-tag">{TAGLINE}</p></span>'
+)
+
+
+def plain_text(fragment):
+    text = re.sub(r"<[^>]+>", " ", fragment or "")
+    return " ".join(html.unescape(text).split())
+
+
+def read_text(path):
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def write_text_atomic(path, text):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=directory or ".", prefix=".page-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def sidecar_path(slug):
+    return os.path.join(PAGES_DIR, ".enhanced", slug + ".html")
+
+
+def apply_tagline(document):
+    """Swap the old site tagline, and add it to a header that does not show one."""
+    document = _OLD_TAGLINE_RE.sub(TAGLINE, document)
+    if 'class="brand-tag"' in document:
+        return document
+    if "<h1>TripAssembler</h1>" in document:
+        return document.replace("<h1>TripAssembler</h1>", _BRAND_LOCKUP, 1)
+    return document
+
+
+def page_title_from_html(document):
+    match = re.search(r"<h2\b[^>]*>(.*?)</h2>", document or "", re.S | re.I)
+    if not match:
+        match = re.search(r"<title>(.*?)</title>", document or "", re.S | re.I)
+    if not match:
+        return ""
+    text = plain_text(match.group(1))
+    return re.sub(r"\s*\|\s*TripAssembler\s*$", "", text).strip()
+
+
+def location_from_html(document):
+    match = re.search(r"<strong>\s*Location:\s*</strong>\s*([^<]+)", document or "", re.I)
+    if match:
+        return plain_text(match.group(1))
+    block = re.search(
+        r'<script type="application/ld\+json">(.*?)</script>',
+        document or "",
+        re.S | re.I,
+    )
+    if not block:
+        return ""
+    try:
+        data = json.loads(block.group(1).strip().replace("<\\/", "</"))
+    except ValueError:
+        return ""
+    nodes = data.get("@graph") if isinstance(data, dict) else None
+    if not isinstance(nodes, list):
+        nodes = [data] if isinstance(data, dict) else []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        dest = node.get("touristDestination")
+        if isinstance(dest, dict) and dest.get("name"):
+            return str(dest["name"]).strip()
+        if isinstance(dest, str) and dest.strip():
+            return dest.strip()
+    return ""
+
+
+def city_from_title_or_slug(title, slug):
+    match = re.search(r"\bin\s+(.+)$", title or "", re.I)
+    if match:
+        return match.group(1).strip(" .")
+    spaced = (slug or "").replace("-", " ").casefold()
+    for key in _PLACE_KEYS:
+        if spaced == key or spaced.startswith(key + " "):
+            return key.title()
+    return ""
+
+
+def popular_slugs():
+    global _popular_slugs
+    if _popular_slugs is None:
+        try:
+            text = read_text(HOME_TEMPLATE)
+        except OSError:
+            text = ""
+        _popular_slugs = set(re.findall(r"""href=['\"]/pages/([A-Za-z0-9][A-Za-z0-9_-]{0,180})""", text))
+    return _popular_slugs
+
+
+def describe_trip(slug, title, location="", created_at=""):
+    title = " ".join(str(title or "").split())
+    location = " ".join(str(location or "").split())
+    if location.lower() in {"see request", "travel"}:
+        location = ""
+    city = ""
+    country = ""
+    if location:
+        bits = [bit.strip() for bit in location.split(",") if bit.strip()]
+        if bits:
+            city = bits[0]
+        if len(bits) >= 2:
+            country = bits[-1]
+    if not city:
+        city = city_from_title_or_slug(title, slug)
+    meta = PLACE_META.get(city.casefold())
+    region = ""
+    if meta:
+        if not country:
+            country = meta[0]
+        region = meta[1]
+    blob = " ".join((slug.replace("-", " "), title, location, city)).casefold()
+    themes = [name for name, words in _THEMES if any(word in blob for word in words)]
+    if city and country and city.casefold() != country.casefold():
+        query = f"{city}, {country}"
+    elif location:
+        query = location
+    else:
+        query = city or title
+    return {
+        "slug": slug,
+        "title": title or (slug or "trip").replace("-", " ").title(),
+        "location": location,
+        "city": city,
+        "country": country,
+        "region": region.casefold(),
+        "themes": themes,
+        "created_at": created_at or "",
+        "popular": slug in popular_slugs(),
+        "query": query,
+    }
+
+
+def _date_rank(created_at):
+    text = str(created_at or "")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return 0
+    try:
+        year, month, day = (int(part) for part in text.split("-"))
+    except ValueError:
+        return 0
+    return year * 10000 + month * 100 + day
+
+
+def _catalog_stamp():
+    try:
+        index_stat = os.stat(INDEX_FILE)
+        index_key = (index_stat.st_mtime_ns, index_stat.st_size)
+    except OSError:
+        index_key = (0, 0)
+    legacy_key = []
+    for slug in legacy_slugs():
+        path = os.path.join(LEGACY_DIR, slug + ".html")
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        legacy_key.append((slug, stat.st_mtime_ns, stat.st_size))
+    return (LEGACY_DIR, index_key, tuple(legacy_key))
+
+
+def trip_catalog():
+    """Legacy pages plus index.json, parsed once until those files change."""
+    key = _catalog_stamp()
+    if _catalog.get("key") == key and _catalog.get("items") is not None:
+        return _catalog["items"]
+    items = {}
+    for slug in legacy_slugs():
+        path = os.path.join(LEGACY_DIR, slug + ".html")
+        try:
+            title = page_title_from_html(read_text(path))
+        except OSError:
+            continue
+        items[slug] = describe_trip(slug, title or slug.replace("-", " "))
+    try:
+        index = load_index()
+    except (OSError, ValueError):
+        index = []
+    if isinstance(index, list):
+        for entry in index:
+            if not isinstance(entry, dict):
+                continue
+            slug = str(entry.get("slug") or "")
+            if not _SLUG_RE.fullmatch(slug) or not resolve_page_file(slug):
+                continue
+            title = str(entry.get("title") or "").strip()
+            location = str(entry.get("location") or "").strip()
+            created = str(entry.get("created_at") or "").strip()
+            if not title:
+                path = resolve_page_file(slug)
+                try:
+                    title = page_title_from_html(read_text(path)) if path else ""
+                except OSError:
+                    title = ""
+            items[slug] = describe_trip(slug, title, location, created_at=created)
+    _catalog["key"] = key
+    _catalog["items"] = list(items.values())
+    return _catalog["items"]
+
+
+def rank_related(current, pool, limit=RELATED_LIMIT):
+    """Same place, then country, then region, then shared themes, then recent and popular."""
+    city = (current.get("city") or "").casefold()
+    country = (current.get("country") or "").casefold()
+    region = (current.get("region") or "").casefold()
+    themes = set(current.get("themes") or [])
+    ranked = []
+    for item in pool:
+        slug = item.get("slug") or ""
+        if not slug or slug == current.get("slug"):
+            continue
+        item_city = (item.get("city") or "").casefold()
+        item_country = (item.get("country") or "").casefold()
+        item_region = (item.get("region") or "").casefold()
+        shared = len(themes & set(item.get("themes") or []))
+        ranked.append((
+            0 if city and item_city and city == item_city else 1,
+            0 if country and item_country and country == item_country else 1,
+            0 if region and item_region and region == item_region else 1,
+            -shared,
+            -_date_rank(item.get("created_at")),
+            0 if item.get("popular") else 1,
+            slug,
+            item,
+        ))
+    ranked.sort(key=lambda row: row[:-1])
+    return [row[-1] for row in ranked[:limit]]
+
+
+def cached_thumb(item, avoid_files=None):
+    """This page's own photo. A shared city image would make every card look the same."""
+    image = assigned_image(item.get("slug") or "")
+    if not image:
+        return None
+    key = image.get("file") or photo_file_key(image.get("src"))
+    if key and key in (avoid_files or set()):
+        return None
+    return image
+
+
+def related_card_html(item, avoid_files=None):
+    href = html.escape(f"/pages/{item['slug']}.html", quote=True)
+    title = esc(item.get("title") or "Trip")
+    meta = item.get("city") or item.get("location") or ""
+    meta_html = f"<small>{esc(meta)}</small>" if meta else ""
+    media = ""
+    attr = ""
+    image = cached_thumb(item, avoid_files)
+    if image and avoid_files is not None:
+        key = image.get("file") or photo_file_key(image.get("src"))
+        if key:
+            avoid_files.add(key)
+    if image:
+        src = safe_url(image.get("src"))
+        if src:
+            try:
+                width = int(image.get("width") or 640)
+                height = int(image.get("height") or 480)
+            except (TypeError, ValueError):
+                width, height = 640, 480
+            alt = esc(image.get("title") or item.get("title") or "Trip photo")
+            media = (
+                f'<img class="related-thumb" src="{src}" width="{width}" height="{height}" '
+                f'alt="{alt}" loading="lazy" decoding="async">'
+            )
+            page = safe_url(image.get("page"))
+            if page:
+                attr = (
+                    f'<p class="wiki-attr-line"><a href="{page}" target="_blank" '
+                    f'rel="noopener noreferrer">{esc(image.get("title") or "Wikipedia")}</a>'
+                    f" · Wikipedia</p>"
+                )
+    return (
+        '<article class="related-card">'
+        f'<a class="related-link" href="{href}">{media}'
+        f'<span class="related-title">{title}</span>{meta_html}</a>'
+        f"{attr}</article>"
+    )
+
+
+def related_section_html(slug, title, location, limit=RELATED_LIMIT):
+    pool = trip_catalog()
+    current = next((item for item in pool if item.get("slug") == slug), None)
+    described = describe_trip(
+        slug,
+        title or (current or {}).get("title", ""),
+        location or (current or {}).get("location", ""),
+        created_at=(current or {}).get("created_at", ""),
+    )
+    if current:
+        described["popular"] = current.get("popular")
+        if not title and not location:
+            described = current
+    picks = rank_related(described, pool, limit=limit)
+    if not picks:
+        return ""
+    used_files = set()
+    current_image = assigned_image(slug)
+    if current_image:
+        current_key = current_image.get("file") or photo_file_key(current_image.get("src"))
+        if current_key:
+            used_files.add(current_key)
+    cards = "".join(related_card_html(item, used_files) for item in picks)
+    section = (
+        '<section class="related-trips" id="related-trips">'
+        "<h2>Related trips</h2>"
+        f'<div class="related-grid">{cards}</div>'
+        "</section>"
+    )
+    # persist_assembly fills PAGE_TEMPLATE with str.format.
+    return section.replace("{", "&#123;").replace("}", "&#125;")
+
+
+def context_for(slug, document):
+    title = ""
+    location = ""
+    created = ""
+    try:
+        index = load_index()
+    except (OSError, ValueError):
+        index = []
+    if isinstance(index, list):
+        for entry in index:
+            if isinstance(entry, dict) and entry.get("slug") == slug:
+                title = str(entry.get("title") or "").strip()
+                location = str(entry.get("location") or "").strip()
+                created = str(entry.get("created_at") or "").strip()
+                break
+    if not title:
+        title = page_title_from_html(document)
+    if not location:
+        location = location_from_html(document)
+    return describe_trip(slug, title, location, created_at=created)
+
+
+def stops_from_html(document):
+    match = re.search(r'<ol class="stops">(.*?)</ol>', document or "", re.S | re.I)
+    if not match:
+        return []
+    labels = []
+    for li in re.findall(r"<li\b[^>]*>(.*?)</li>", match.group(1), re.S | re.I):
+        if "stop-thumb" in li:
+            labels.append(None)
+            continue
+        link = re.search(r"<a\b[^>]*>(.*?)</a>", li, re.S | re.I)
+        label = plain_text(link.group(1) if link else li)
+        labels.append(label or None)
+    return labels
+
+
+def days_from_html(document):
+    days = []
+    for body in re.findall(r'<div class="day">(.*?)</div>', document or "", re.S | re.I):
+        if "day-photo" in body:
+            days.append(None)
+            continue
+        heading = re.search(r"<h3\b[^>]*>(.*?)</h3>", body, re.S | re.I)
+        title = plain_text(heading.group(1) if heading else "")
+        title = re.sub(r"^Day\s+\d+\s*:\s*", "", title, flags=re.I).strip()
+        days.append(title or None)
+    return days
+
+
+def day_is_identifiable(title, city):
+    text = " ".join(str(title or "").split())
+    if len(text) < 6 or _GENERIC_DAY.match(text):
+        return False
+    if city and text.casefold() == city.casefold():
+        return False
+    return True
+
+
+def needs_image_lookup(document):
+    if ENHANCED_MARKER in document:
+        return False
+    markers = ('class="hero-photo"', 'class="stop-thumb"', 'class="day-photo"')
+    return not any(marker in document for marker in markers)
+
+
+def inject_hero(document, image, alt):
+    figure = photo_figure(image, alt, "hero-photo")
+    if not figure or 'class="hero-photo"' in document:
+        return document
+    document = _PAGE_ICON_RE.sub("\n", document, count=1)
+    match = _TITLE_BLOCK_RE.search(document)
+    if not match:
+        needle = '<div class="container">'
+        if needle in document:
+            return document.replace(needle, needle + "\n" + figure, 1)
+        return figure + document
+    return document[:match.end()] + "\n" + figure + document[match.end():]
+
+
+def inject_stop_images(document, labels, found):
+    match = re.search(r'(<ol class="stops">)(.*?)(</ol>)', document, re.S | re.I)
+    if not match:
+        return document
+    body = match.group(2)
+    lis = list(re.finditer(r"<li\b[^>]*>.*?</li>", body, re.S | re.I))
+    pieces = []
+    cursor = 0
+    for index, li in enumerate(lis):
+        pieces.append(body[cursor:li.start()])
+        image = found.get(f"stop:{index}")
+        label = labels[index] if index < len(labels) else None
+        if image and label and "stop-thumb" not in li.group(0):
+            pieces.append(stop_li_html(label, image))
+        else:
+            pieces.append(li.group(0))
+        cursor = li.end()
+    pieces.append(body[cursor:])
+    return document[:match.start(2)] + "".join(pieces) + document[match.end(2):]
+
+
+def inject_day_images(document, titles, found):
+    matches = list(re.finditer(r'<div class="day">.*?</div>', document, re.S | re.I))
+    if not matches:
+        return document
+    pieces = []
+    cursor = 0
+    for index, match in enumerate(matches):
+        pieces.append(document[cursor:match.start()])
+        block = match.group(0)
+        image = found.get(f"day:{index}")
+        title = titles[index] if index < len(titles) else ""
+        if image and title and "day-photo" not in block:
+            figure = photo_figure(image, title, "day-photo")
+            block = block.replace('<div class="day">', '<div class="day">' + figure, 1)
+        pieces.append(block)
+        cursor = match.end()
+    pieces.append(document[cursor:])
+    return "".join(pieces)
+
+
+def with_json_ld_image(document, image_url):
+    if not image_url:
+        return document
+    match = re.search(
+        r'(<script type="application/ld\+json">)(.*?)(</script>)',
+        document,
+        re.S | re.I,
+    )
+    if not match:
+        return document
+    try:
+        data = json.loads(match.group(2).strip().replace("<\\/", "</"))
+    except ValueError:
+        return document
+    nodes = data.get("@graph") if isinstance(data, dict) else None
+    if not isinstance(nodes, list):
+        return document
+    changed = False
+    for node in nodes:
+        if isinstance(node, dict) and node.get("@type") == "TouristTrip" and not node.get("image"):
+            node["image"] = image_url
+            changed = True
+            break
+    if not changed:
+        return document
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return document[:match.start(2)] + payload + document[match.end(2):]
+
+
+def inject_related(document, section):
+    if not section or 'id="related-trips"' in document:
+        return document
+    document = _OLD_RELATED_RE.sub("\n", document, count=1)
+    for needle in ('<div class="actions">', "<footer>", "<footer "):
+        if needle in document:
+            return document.replace(needle, section + "\n" + needle, 1)
+    if "</body>" in document:
+        return document.replace("</body>", section + "\n</body>", 1)
+    return document + "\n" + section
+
+
+async def inject_images(document, info):
+    stops = stops_from_html(document)
+    days = days_from_html(document)
+    specs = []
+    city = info.get("city") or ""
+    for index, label in enumerate(stops):
+        if label and sum(1 for key, _, _ in specs if str(key).startswith("stop:")) < 6:
+            specs.append((f"stop:{index}", "", label))
+    for index, title in enumerate(days):
+        if not title or not day_is_identifiable(title, city):
+            continue
+        if sum(1 for key, _, _ in specs if str(key).startswith("day:")) >= 3:
+            break
+        if city and city.casefold() not in title.casefold():
+            day_query = f"{title}, {city}"
+        else:
+            day_query = title
+        specs.append((f"day:{index}", "", day_query))
+    started = time.monotonic()
+    hero = None
+    if info.get("slug") and location_key(info):
+        hero = await assign_hero_image(info, timeout=ENHANCE_TIMEOUT)
+    used = set()
+    if hero:
+        hero_key = hero.get("file") or photo_file_key(hero.get("src"))
+        if hero_key:
+            used.add(hero_key)
+        alt = info.get("city") or info.get("title") or "Destination"
+        document = inject_hero(document, hero, alt)
+        src = str(hero.get("src") or "")
+        if src.startswith("https://") and _wiki_host(src):
+            document = with_json_ld_image(document, src)
+    remaining = ENHANCE_TIMEOUT - (time.monotonic() - started)
+    found = {}
+    if specs and remaining > 0.2:
+        found = await resolve_images(specs, timeout=remaining)
+    hero_key = ""
+    if hero:
+        hero_key = hero.get("file") or photo_file_key(hero.get("src"))
+    for key, image in list(found.items()):
+        file_key = image.get("file") or photo_file_key(image.get("src")) if isinstance(image, dict) else ""
+        if file_key and hero_key and file_key == hero_key:
+            found.pop(key, None)
+    if any(found.get(f"stop:{index}") for index in range(len(stops))):
+        document = inject_stop_images(document, stops, found)
+    if any(found.get(f"day:{index}") for index in range(len(days))):
+        document = inject_day_images(document, days, found)
+    if "wikimedia.org" in document and 'href="https://thumb.wikimedia.org"' not in document:
+        if "</head>" in document:
+            document = document.replace(
+                "</head>",
+                '<link rel="preconnect" href="https://thumb.wikimedia.org" crossorigin>\n</head>',
+                1,
+            )
+    return document
+
+
+def strip_enhanced_media(document):
+    """Remove a previous photo and related-trips pass so it can be built again."""
+    document = re.sub(r"\s*<figure class=\"hero-photo\">.*?</figure>", "", document or "", flags=re.S)
+    document = re.sub(r"<figure class=\"day-photo\">.*?</figure>", "", document, flags=re.S)
+    document = re.sub(
+        r"\s*<section class=\"related-trips\" id=\"related-trips\">.*?</section>",
+        "",
+        document,
+        flags=re.S,
+    )
+    return document.replace(ENHANCED_MARKER, "")
+
+
+async def enhance_document(slug, document):
+    """Add photos, related trips, and the tagline. Raises if image lookup itself raises."""
+    if ENHANCED_MARKER in document and 'id="related-trips"' in document:
+        return apply_tagline(document)
+    document = apply_tagline(document)
+    info = context_for(slug, document)
+    if needs_image_lookup(document):
+        document = await inject_images(document, info)
+    if 'id="related-trips"' not in document:
+        section = related_section_html(
+            slug,
+            info.get("title") or "",
+            info.get("location") or "",
+        )
+        document = inject_related(document, section)
+    if ENHANCED_MARKER not in document:
+        if "</body>" in document:
+            document = document.replace("</body>", ENHANCED_MARKER + "\n</body>", 1)
+        else:
+            document += "\n" + ENHANCED_MARKER + "\n"
+    return document
+
+
+async def prepare_served_page(slug, path):
+    lock = _page_locks.get(slug)
+    if lock is None:
+        lock = asyncio.Lock()
+        _page_locks[slug] = lock
+    async with lock:
+        stat = os.stat(path)
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        cached = _page_mem.get(slug)
+        if cached and cached.get("stamp") == stamp:
+            return cached["html"]
+        document = read_text(path)
+        if ENHANCED_MARKER in document and 'id="related-trips"' in document:
+            document = apply_tagline(document)
+            _page_mem[slug] = {"stamp": stamp, "html": document}
+            return document
+        side = sidecar_path(slug)
+        on_disk = _inside(path, PAGES_DIR)
+        if (
+            not on_disk
+            and os.path.isfile(side)
+            and os.stat(side).st_mtime_ns >= stat.st_mtime_ns
+        ):
+            side_html = read_text(side)
+            if ENHANCED_MARKER in side_html:
+                side_html = apply_tagline(side_html)
+                _page_mem[slug] = {"stamp": stamp, "html": side_html}
+                return side_html
+        try:
+            updated = await enhance_document(slug, document)
+        except Exception:
+            log.warning("could not enhance %s", slug, exc_info=True)
+            updated = apply_tagline(document)
+            _page_mem[slug] = {"stamp": stamp, "html": updated}
+            return updated
+        if updated != document:
+            try:
+                if on_disk:
+                    write_text_atomic(path, updated)
+                    stat = os.stat(path)
+                    stamp = (stat.st_mtime_ns, stat.st_size)
+                else:
+                    write_text_atomic(side, updated)
+            except OSError:
+                log.warning("could not store enhanced html for %s", slug, exc_info=True)
+        _page_mem[slug] = {"stamp": stamp, "html": updated}
+        return updated
+
+
 @app.get("/pages/{slug}")
 async def serve_page(slug: str):
     path = resolve_page_file(slug)
@@ -1623,4 +2926,21 @@ async def serve_page(slug: str):
             render_simple("Page not found", "That trip page is not here."),
             status_code=404,
         )
-    return FileResponse(path, media_type="text/html")
+    name = slug[:-5] if slug.endswith(".html") else slug
+    if not _SLUG_RE.fullmatch(name):
+        return HTMLResponse(
+            render_simple("Page not found", "That trip page is not here."),
+            status_code=404,
+        )
+    try:
+        html_out = await prepare_served_page(name, path)
+    except Exception:
+        log.exception("serve enhance failed for %s", name)
+        try:
+            html_out = apply_tagline(read_text(path))
+        except OSError:
+            return HTMLResponse(
+                render_simple("Page not found", "That trip page is not here."),
+                status_code=404,
+            )
+    return HTMLResponse(html_out, media_type="text/html")
