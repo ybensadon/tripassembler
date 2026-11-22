@@ -122,6 +122,20 @@ def _photo_identity(url):
     return token, title
 
 
+def _place_hint(url):
+    """Enough of a place name for the quality filter, including ambiguous cities."""
+    low = unquote(url).casefold()
+    if "lisbon" in low:
+        return "Lisbon Portugal Belem"
+    if "paris" in low:
+        return "Paris France"
+    if "amsterdam" in low:
+        return "Amsterdam Netherlands canal"
+    if "reykjav" in low or "iceland" in low or "hallgr" in low or "harpa" in low:
+        return "Reykjavik Iceland"
+    return ""
+
+
 def wiki_handler(request):
     url = str(request.url)
     WIKI_CALLS.append(url)
@@ -131,17 +145,36 @@ def wiki_handler(request):
         if "rest_v1" in url:
             return httpx.Response(404, json={"type": "not_found"})
         return httpx.Response(200, json={"query": {"pages": {"-1": {"missing": ""}}}})
+    slug, title = _photo_identity(url)
+    hint = _place_hint(url) or title
+    file_name = f"{slug}.jpg"
     if "prop=imageinfo" in url or "iiurlwidth=" in url:
-        return httpx.Response(200, json={"query": {"pages": {}}})
+        return httpx.Response(200, json={"query": {"pages": {"1": {
+            "title": f"File:{file_name}",
+            "imageinfo": [{
+                "thumburl": f"https://thumb.wikimedia.org/wikipedia/commons/thumb/8/8b/{file_name}/640px-{file_name}",
+                "thumbwidth": 640,
+                "thumbheight": 480,
+                "width": 1600,
+                "height": 1000,
+                "mime": "image/jpeg",
+                "descriptionurl": f"https://commons.wikimedia.org/wiki/File:{file_name}",
+                "extmetadata": {
+                    "DateTimeOriginal": {"value": "2018-06-01 12:00:00"},
+                    "ObjectName": {"value": f"{title} {hint}"},
+                    "ImageDescription": {"value": hint},
+                    "Categories": {"value": f"{hint}|Quality images"},
+                },
+            }],
+        }}}})
     if "prop=images" in url or "imlimit=" in url:
         return httpx.Response(200, json={"query": {"pages": {"1": {"title": "Place", "images": []}}}})
-    slug, title = _photo_identity(url)
     if "rest_v1" in url:
         return httpx.Response(200, json={
             "type": "standard",
             "title": title,
             "thumbnail": {
-                "source": f"https://thumb.wikimedia.org/wikipedia/commons/thumb/8/8b/{slug}.jpg/330px-{slug}.jpg",
+                "source": f"https://thumb.wikimedia.org/wikipedia/commons/thumb/8/8b/{file_name}/330px-{file_name}",
                 "width": 330,
                 "height": 290,
             },
@@ -149,8 +182,9 @@ def wiki_handler(request):
         })
     return httpx.Response(200, json={"query": {"pages": {"1": {
         "title": title,
+        "pageimage": file_name,
         "thumbnail": {
-            "source": f"https://thumb.wikimedia.org/wikipedia/commons/thumb/8/8b/{slug}.jpg/640px-{slug}.jpg",
+            "source": f"https://thumb.wikimedia.org/wikipedia/commons/thumb/8/8b/{file_name}/640px-{file_name}",
             "width": 640,
             "height": 480,
         },
@@ -680,6 +714,68 @@ class SmokeTests(unittest.TestCase):
             "https://upload.wikimedia.org/wikipedia/commons/Map_of_Amsterdam.png",
             "Map of Amsterdam.png",
         ))
+        places = ["Amsterdam", "Netherlands"]
+        good = {
+            "file": "amsterdam_canal_2018.jpg",
+            "title": "Amsterdam canal 2018",
+            "full_width": 1600,
+            "full_height": 900,
+            "meta_blob": "Amsterdam Quality images 2018-06-01",
+        }
+        self.assertTrue(app.passes_quality(good, places, ()))
+        self.assertFalse(app.passes_quality(
+            dict(good, title="Banquet of the Amsterdam Civic Guard", file="banquet.jpg", meta_blob="oil on canvas 1648"),
+            places,
+            (),
+        ))
+        self.assertFalse(app.passes_quality(
+            dict(good, title="Old Amsterdam 1891 street", file="old-amsterdam_1891-street-1.jpg", meta_blob="1891"),
+            places,
+            (),
+        ))
+        self.assertFalse(app.passes_quality(
+            dict(good, title="Gercse osszel", file="gercse_osszel.jpg", meta_blob="Gercse Hungary autumn"),
+            places,
+            (),
+        ))
+        self.assertFalse(app.passes_quality(dict(good, full_width=800, full_height=1200), places, ()))
+        self.assertFalse(app.passes_quality(dict(good, full_width=600, full_height=400), places, ()))
+        self.assertFalse(app.passes_quality(
+            dict(good, title="HEADER", file="header.jpg", trusted=True, meta_blob="Paris skyline"),
+            places,
+            (),
+        ))
+        self.assertFalse(app.passes_quality(
+            dict(good, title="Athens Georgia City Hall", file="athens_georgia_city_hall.jpg", meta_blob="Georgia"),
+            ["Athens", "Greece"],
+            ("georgia",),
+        ))
+        self.assertFalse(app.passes_quality(
+            dict(good, title="Iceland satellite", file="iceland_satellite.jpg", meta_blob="Iceland"),
+            ["Iceland"],
+            (),
+        ))
+        self.assertFalse(app.passes_quality(
+            dict(good, title="A girl posing in a flower field", file="girl_posing.jpg"),
+            places,
+            (),
+        ))
+        self.assertFalse(app.passes_quality(
+            dict(good, title="Breviceps gibbosus Cape Rain Frog", file="breviceps.jpg"),
+            places,
+            (),
+        ))
+        self.assertFalse(app.passes_quality(
+            dict(good, page="https://en.wikipedia.org/wiki/London_Eye"),
+            places,
+            (),
+        ))
+        self.assertTrue(app.passes_quality(
+            dict(good, page="https://commons.wikimedia.org/wiki/File:Amsterdam_canal_2018.jpg"),
+            places,
+            (),
+        ))
+        self.assertIsNone(app.choose_distinct("amsterdam-pet-friendly", pool, {image["file"] for image in pool}))
         taken = set()
         picked = []
         for slug in ("amsterdam-pet-friendly", "amsterdam-with-private-pool", "amsterdam-walkable"):
@@ -692,10 +788,10 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(again["file"], picked[0])
 
         photos = [
-            ("Canal_houses.jpg", "Canal houses"),
-            ("Rijksmuseum.jpg", "Rijksmuseum"),
-            ("Vondelpark.jpg", "Vondelpark"),
-            ("Jordaan_street.jpg", "Jordaan"),
+            ("Amsterdam_canal_houses_2019.jpg", "Amsterdam canal houses 2019"),
+            ("Amsterdam_rijksmuseum_2018.jpg", "Amsterdam rijksmuseum 2018"),
+            ("Amsterdam_vondelpark_2016.jpg", "Amsterdam vondelpark 2016"),
+            ("Amsterdam_jordaan_2014.jpg", "Amsterdam jordaan 2014"),
         ]
 
         def rich_handler(request):
@@ -703,17 +799,25 @@ class SmokeTests(unittest.TestCase):
             WIKI_CALLS.append(url)
             if "prop=imageinfo" in url or "iiurlwidth=" in url:
                 pages = {}
+                include_all = "filetype:bitmap" in url or "File:" in url
                 for index, (name, label) in enumerate(photos, start=1):
-                    if name not in url and label not in url and "File:" not in url:
+                    if not include_all and name not in url and label not in url:
                         continue
                     pages[str(index)] = {
                         "title": f"File:{name}",
                         "imageinfo": [{
-                            "thumburl": f"https://upload.wikimedia.org/wikipedia/commons/thumb/a/a{index}/{name}/640px-{name}",
-                            "thumbwidth": 640,
-                            "thumbheight": 400 + index,
+                            "thumburl": f"https://upload.wikimedia.org/wikipedia/commons/thumb/a/a{index}/{name}/1280px-{name}",
+                            "thumbwidth": 1280,
+                            "thumbheight": 800,
+                            "width": 1600,
+                            "height": 1000,
                             "mime": "image/jpeg",
                             "descriptionurl": f"https://commons.wikimedia.org/wiki/File:{name}",
+                            "extmetadata": {
+                                "DateTimeOriginal": {"value": "2018-06-01 12:00:00"},
+                                "ObjectName": {"value": label},
+                                "Categories": {"value": "Amsterdam|Quality images"},
+                            },
                         }],
                     }
                 return httpx.Response(200, json={"query": {"pages": pages}})
