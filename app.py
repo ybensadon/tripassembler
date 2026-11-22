@@ -58,7 +58,10 @@ _cache_loaded = False
 # Served pages (legacy files and older generated HTML) get one pass that adds
 # photos, related trips, and the current tagline. The marker makes that pass idempotent.
 TAGLINE = "Assemble the perfect Trip"
-ENHANCED_MARKER = "<!-- ta-enhanced -->"
+# v2 drops paintings, pre-1990 photos, and pictures of the wrong place.
+# Older pages still say <!-- ta-enhanced --> and are rebuilt on the next view.
+ENHANCED_MARKER = "<!-- ta-enhanced v2 -->"
+ASSIGN_VERSION = 2
 ENHANCE_TIMEOUT = 6.0
 RELATED_LIMIT = 6
 _page_mem = {}
@@ -582,7 +585,7 @@ async def lookup_image(http, wiki_title="", query=""):
 # Maps, flags, logos, and icons are not trip photos. Match the file name, not the city name.
 _BAD_PHOTO = re.compile(
     r"(flag[_ -]?of|(^|[_ -])flag([_ .-]|$)|logo|(^|[_ -])icon([_ .-]|$)|"
-    r"locator|(^|[_ -])map([_ .-]|$)|map[_ -]of|coat[_ -]?of[_ -]?arms|"
+    r"locator|(^|[_ -])map([_ .-]|$)|map[_ -]of|coat[_ -]?of[_ -]?arms|satellite|"
     r"(^|[_ -])seal([_ .-]|$)|emblem|wordmark|pictogram|(^|[_ -])symbol([_ .-]|$)|"
     r"(^|[_ -])badge([_ .-]|$)|diagram|location[_ -]?map|relief[_ -]?map|orthographic|opentopo|topographic)",
     re.I,
@@ -625,13 +628,13 @@ def load_assignments():
     global _assignments
     if _assignments is not None:
         return _assignments
-    _assignments = {}
+    _assignments = {"version": ASSIGN_VERSION}
     try:
         with open(assignment_path(), encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, ValueError):
         return _assignments
-    if isinstance(data, dict):
+    if isinstance(data, dict) and data.get("version") == ASSIGN_VERSION:
         _assignments = data
     return _assignments
 
@@ -647,7 +650,7 @@ def save_assignments():
 
 def reset_assignments():
     global _assignments
-    _assignments = {}
+    _assignments = {"version": ASSIGN_VERSION}
     try:
         os.remove(assignment_path())
     except OSError:
@@ -693,46 +696,6 @@ def _ordered_pages(data):
         (page for page in pages.values() if isinstance(page, dict)),
         key=lambda page: page.get("index") if isinstance(page.get("index"), int) else 0,
     )
-
-
-def _collect_thumbs(data):
-    found = []
-    seen = set()
-    for page in _ordered_pages(data):
-        if "missing" in page:
-            continue
-        thumb = page.get("thumbnail") or {}
-        image = _wiki_image(
-            thumb.get("source"),
-            thumb.get("width"),
-            thumb.get("height"),
-            page.get("fullurl"),
-            page.get("title"),
-        )
-        if not image or not is_real_photo(image["src"], image.get("title") or ""):
-            continue
-        key = photo_file_key(image["src"])
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        image["file"] = key
-        found.append(image)
-    return found
-
-
-async def fetch_search_pool(http, query, limit=8):
-    """Several photographed search hits, in relevance order."""
-    data = await _get_json(http, WIKI_API, {
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": query,
-        "gsrlimit": str(limit),
-        "prop": "pageimages|info",
-        "inprop": "url",
-        "pithumbsize": "640",
-        "format": "json",
-    })
-    return _collect_thumbs(data)
 
 
 def mentions_place(text, city):
@@ -942,7 +905,7 @@ def choose_distinct(slug, pool, taken_files):
         image = usable[(start + step) % len(usable)]
         if image["file"] not in taken_files:
             return image
-    return usable[start]
+    return None
 
 
 def merge_pool(existing, extra):
@@ -956,51 +919,439 @@ def merge_pool(existing, extra):
     return merged
 
 
-async def build_location_pool(info, extra_queries=None, timeout=6.0):
-    queries = list(pool_queries(info))
-    seen_queries = {query.casefold() for query in queries}
+_CITY_LANDMARKS = {
+    "amsterdam": ("canal", "jordaan", "rijksmuseum", "dam square"),
+    "athens": ("acropolis", "parthenon", "plaka", "greece"),
+    "bali": ("ubud", "tanah lot"),
+    "banff": ("lake louise",),
+    "bangkok": ("grand palace", "wat arun"),
+    "barcelona": ("sagrada familia", "gothic quarter", "barceloneta"),
+    "budapest": ("parliament", "danube", "buda castle"),
+    "cancun": ("hotel zone", "playa"),
+    "cape town": ("table mountain", "v&a waterfront"),
+    "dubai": ("burj khalifa", "dubai marina"),
+    "dubrovnik": ("city walls", "old town"),
+    "kyoto": ("fushimi", "gion"),
+    "lisbon": ("belem", "alfama"),
+    "london": ("london eye", "tower bridge", "westminster"),
+    "los angeles": ("hollywood", "santa monica"),
+    "marrakech": ("jemaa", "medina", "marrakesh"),
+    "maui": ("haleakala", "lahaina"),
+    "miami": ("miami beach", "south beach"),
+    "new york": ("manhattan", "central park", "times square"),
+    "oahu": ("waikiki", "diamond head"),
+    "osaka": ("osaka castle", "dotonbori"),
+    "paris": ("eiffel", "louvre", "seine", "montmartre"),
+    "phuket": ("patong",),
+    "prague": ("charles bridge", "prague castle", "old town square"),
+    "rome": ("colosseum", "trevi"),
+    "santorini": ("oia", "caldera"),
+    "singapore": ("marina bay", "merlion"),
+    "split": ("diocletian",),
+    "sydney": ("opera house", "harbour bridge"),
+    "tokyo": ("shibuya", "shinjuku", "skytree"),
+    "tulum": ("tulum ruins",),
+    "vienna": ("schönbrunn", "schonbrunn", "stephansdom"),
+}
+_CONFUSERS = {
+    "london": ("ontario", "jack london"),
+    "paris": (
+        "paris jackson", "paris hilton", "paris, texas", "paris texas",
+        "las vegas", "bellagio", "ontario", "grand river", "villaines", "paris brest",
+    ),
+    "lisbon": (
+        "ontario", "louisiana", "united methodist", "lisbon, on", "lisbon, la",
+        "lisbon falls", "maine", "new hampshire", "lisbon, nh",
+    ),
+    "bali": ("myna", "ituri", "rdc", "congo"),
+    "prague": ("nebraska",),
+    "split": ("split pea", "split rock", "minnesota"),
+    "vienna": ("illinois", "virginia", "johnson county", "west virginia"),
+    "tulum": ("istanbul", "tulumcu"),
+    "osaka": ("skimmer", "dragonfly"),
+    "athens": ("georgia", "athens, ga"),
+    "maui": ("oakland", "container ship"),
+}
+_ART_WORDS = re.compile(
+    r"\b(painting|oil on canvas|engraving|engraved|etching|lithograph|"
+    r"watercolor|watercolour|drawing|illustration|sketch|miniature|"
+    r"portrait|self-portrait|artwork|coat of arms|diagram|photochrom|"
+    r"chromolithograph|historic|historical|circa|banquet of the|civic guard|"
+    r"vintage|woodcut|fresco|daguerreotype|invasion|uprising|"
+    r"selfie|headshot|group photograph|group photo|family members|posing|puja)\b",
+    re.I,
+)
+# A species, not a place. "Bird's-eye" cityscapes do not match these phrases.
+_WILDLIFE = re.compile(
+    r"\b(frog|frogs|egret|egrets|heron|herons|skimmer|dragonfly|dragonflies|"
+    r"myna|genus|beetle|butterfly|butterflies|spider|spiders|snake|snakes|"
+    r"lizard|lizards|gecko|varied tit|rain frog|cats?|kittens?|"
+    r"whales?|dolphins?|sharks?)\b",
+    re.I,
+)
+_WILDLIFE_CATEGORY = re.compile(
+    r"\b(birds|amphibians|insects|arachnids|reptiles|moths|butterflies) of\b",
+    re.I,
+)
+_GENERIC_FILE = re.compile(
+    r"^(header|untitled|img|image|dscn?|picture|photo|wp)(?:\b|[_ .-]|\d)",
+    re.I,
+)
+_SCENE_STOP = {
+    "the", "of", "and", "in", "at", "a", "an", "from", "on", "to", "with", "for",
+    "de", "la", "le", "el", "di", "da", "del", "jpg", "jpeg",
+}
+_OLD_CENTURY = re.compile(
+    r"\b(1[6-9]th-century|century photograph|century painting)\b",
+    re.I,
+)
+
+
+def _meta_value(ext, key):
+    raw = (ext or {}).get(key)
+    if isinstance(raw, dict):
+        raw = raw.get("value")
+    if not raw:
+        return ""
+    return re.sub(r"<[^>]+>", " ", str(raw))
+
+
+def _years_in(text):
+    return [int(year) for year in re.findall(r"(?<![0-9])(1[6-9]\d{2}|20\d{2})(?![0-9])", text or "")]
+
+
+def place_terms(city, country=""):
+    terms = []
+    if city:
+        terms.append(city)
+    alias = _ARTICLE_TITLES.get((city or "").casefold(), "")
+    if alias:
+        terms.append(alias)
+    terms.extend(_CITY_LANDMARKS.get((city or "").casefold(), ()))
+    if country and city and country.casefold() == city.casefold():
+        terms.append(country)
+    if (country or "").casefold() in {"iceland", "singapore", "maldives"}:
+        terms.append(country)
+    return terms
+
+
+# City name alone is shared with other towns. These also need the country or a landmark.
+_AMBIGUOUS_PLACES = {
+    "athens": ("greece", "hellas", "acropolis", "parthenon", "plaka", "syntagma"),
+    "lisbon": ("portugal", "lisboa", "belem", "alfama", "chiado", "são jorge", "sao jorge"),
+    "paris": ("france", "eiffel", "louvre", "seine", "montmartre", "notre", "parisien"),
+    "london": ("england", "united kingdom", "thames", "westminster", "london eye", "tower bridge"),
+    "prague": ("czechia", "czech", "praha", "charles bridge", "prague castle", "pankrac", "pankrác"),
+    "vienna": ("austria", "wien", "schönbrunn", "schonbrunn", "stephansdom", "belvedere"),
+    "split": ("croatia", "hrvatska", "diocletian"),
+}
+
+
+def _is_file_page(page):
+    text = unquote(str(page or ""))
+    return "File:" in text
+
+
+def _scene_tokens(file_name):
+    text = unquote(str(file_name or "")).casefold().replace("_", " ")
+    text = re.sub(r"\.(jpe?g)$", "", text)
+    text = re.sub(r"\d+", " ", text)
+    return [tok for tok in re.findall(r"[a-z]{3,}", text) if tok not in _SCENE_STOP]
+
+
+def _too_similar(left_name, right_name):
+    """Same scene shot twice (Athens 9578/9582, Phuket DD 01/04)."""
+    left, right = set(_scene_tokens(left_name)), set(_scene_tokens(right_name))
+    if not left or not right:
+        return False
+    if len(left) <= 2 or len(right) <= 2:
+        return left == right
+    return len(left & right) / len(left | right) >= 0.72
+
+
+def passes_quality(image, places, confusers=()):
+    """Modern landscape photograph of this place. Rejects art, old photos, and mismatches."""
+    title = f"{image.get('title') or ''} {image.get('file') or ''}".replace("_", " ")
+    blob = f"{title} {image.get('meta_blob') or ''}"
+    folded = blob.casefold()
+    file_name = str(image.get("file") or "")
+    if not re.search(r"\.jpe?g$", file_name, re.I):
+        return False
+    page = str(image.get("page") or "")
+    if page and not _is_file_page(page):
+        return False
+    if _BAD_PHOTO.search(title) or _ART_WORDS.search(blob) or _OLD_CENTURY.search(blob):
+        return False
+    if _WILDLIFE.search(title):
+        return False
+    if _WILDLIFE_CATEGORY.search(blob) and not re.search(
+        r"\b(skyline|canal|beach|palace|castle|bridge|street|square|harbour|harbor|"
+        r"panorama|aerial|waterfront|temple|cathedral|mosque|tower)\b",
+        title,
+        re.I,
+    ):
+        return False
+    without_old_town = re.sub(r"\bold town\b", " ", title, flags=re.I)
+    if re.search(r"\b(old|historic|historical|circa)\b", without_old_town, re.I):
+        return False
+    if image.get("date_year") and int(image["date_year"]) < 1990:
+        return False
+    # A year in the file title is the picture's date. Years buried in a caption are not.
+    title_years = _years_in(title)
+    if title_years and min(title_years) < 1990:
+        return False
+    for word in confusers:
+        if word and word.casefold() in folded:
+            return False
+    full_width = int(image.get("full_width") or 0)
+    full_height = int(image.get("full_height") or 0)
+    width = full_width or int(image.get("width") or 0)
+    height = full_height or int(image.get("height") or 0)
+    if full_width and full_width < 800:
+        return False
+    if width and height and (width / height) < 1.2:
+        return False
+    stem = re.sub(r"\.(jpe?g)$", "", file_name, flags=re.I).replace("_", " ")
+    generic = bool(_GENERIC_FILE.match(stem))
+    needed = list(places)
+    extra = _AMBIGUOUS_PLACES.get((places[0] if places else "").casefold(), ())
+    if extra:
+        # Ignore the bare city name; require the country or a landmark.
+        needed = [term for term in places[1:] if term] + list(extra)
+    named = any(mentions_place(blob, term) for term in needed if term)
+    named_in_file = any(mentions_place(stem, term) for term in needed if term)
+    # Camera-dump names ("HEADER.jpg") are not a place photo unless the file name says so.
+    if generic and not named_in_file:
+        return False
+    # The city article's lead image is of that article. Every other file must name the place.
+    if image.get("trusted") and not generic:
+        return True
+    return named
+
+
+def _image_from_info(page, lead=False):
+    meta = (page.get("imageinfo") or [None])[0]
+    if not isinstance(meta, dict):
+        return None
+    mime = str(meta.get("mime") or "").lower()
+    label = str(page.get("title") or "").replace("_", " ")
+    if label.lower().startswith("file:"):
+        label = label[5:]
+    if mime and mime != "image/jpeg" and not re.search(r"\.jpe?g$", label, re.I):
+        return None
+    ext = meta.get("extmetadata") or {}
+    date_text = _meta_value(ext, "DateTimeOriginal") or _meta_value(ext, "DateTime")
+    date_years = _years_in(date_text)
+    blob = " ".join(
+        _meta_value(ext, key)
+        for key in ("DateTimeOriginal", "DateTime", "ObjectName", "ImageDescription", "Categories", "Artist")
+    )
+    image = _wiki_image(
+        _https_url(meta.get("thumburl") or meta.get("url")),
+        meta.get("thumbwidth") or meta.get("width"),
+        meta.get("thumbheight") or meta.get("height"),
+        meta.get("descriptionurl"),
+        label,
+    )
+    if not image:
+        return None
+    image["file"] = photo_file_key(image["src"]) or label.casefold()
+    image["full_width"] = int(meta.get("width") or 0)
+    image["full_height"] = int(meta.get("height") or 0)
+    image["meta_blob"] = blob
+    categories = blob.casefold()
+    score = 1 if lead else 0
+    if "featured picture" in categories:
+        score += 3
+    if "quality image" in categories:
+        score += 2
+    image["score"] = score
+    image["trusted"] = bool(lead)
+    image["date_year"] = min(date_years) if date_years else 0
+    return image
+
+
+def _info_pages(data):
+    pages = ((data or {}).get("query") or {}).get("pages") or {}
+    if not isinstance(pages, dict):
+        return []
+    return [page for page in pages.values() if isinstance(page, dict)]
+
+
+async def _imageinfo_files(http, names):
+    found = []
+    clean = []
+    seen = set()
+    for name in names:
+        text = str(name or "").strip()
+        if not text:
+            continue
+        if not text.lower().startswith("file:"):
+            text = "File:" + text
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(text)
+    for start in range(0, len(clean), 6):
+        data = await _get_json(http, WIKI_API, {
+            "action": "query",
+            "titles": "|".join(clean[start:start + 6]),
+            "prop": "imageinfo",
+            "iiprop": "url|size|mime|extmetadata",
+            "iiurlwidth": "1280",
+            "format": "json",
+        })
+        for page in _info_pages(data):
+            image = _image_from_info(page)
+            if image:
+                found.append(image)
+    return found
+
+
+async def fetch_lead_filename(http, title):
+    data = await _get_json(http, WIKI_API, {
+        "action": "query",
+        "titles": title,
+        "prop": "pageimages",
+        "pithumbsize": "1280",
+        "redirects": "1",
+        "format": "json",
+    })
+    for page in _info_pages(data):
+        name = page.get("pageimage")
+        if name:
+            return name
+    return ""
+
+
+async def fetch_commons_photos(http, query):
+    """Bitmap files on Commons for this search, with quality metadata attached."""
+    data = await _get_json(http, "https://commons.wikimedia.org/w/api.php", {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": "6",
+        "gsrlimit": "16",
+        "prop": "imageinfo",
+        "iiprop": "url|size|mime|extmetadata",
+        "iiurlwidth": "1280",
+        "format": "json",
+    })
+    return [image for image in (_image_from_info(page) for page in _info_pages(data)) if image]
+
+
+async def fetch_search_filenames(http, query, limit=4):
+    data = await _get_json(http, WIKI_API, {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrlimit": str(limit),
+        "prop": "pageimages",
+        "pithumbsize": "640",
+        "format": "json",
+    })
+    names = []
+    for page in _ordered_pages(data):
+        name = page.get("pageimage")
+        if name:
+            names.append(name)
+    return names
+
+
+def _drop_near_duplicates(images):
+    kept = []
+    for image in images:
+        if any(_too_similar(image.get("file"), other.get("file")) for other in kept):
+            continue
+        kept.append(image)
+    return kept
+
+
+def _keep_quality(images, places, city, min_count=6):
+    confusers = _CONFUSERS.get((city or "").casefold(), ())
+    kept = {}
+    rejected = set()
+    for image in images:
+        key = image.get("file") or ""
+        if not key or key in rejected:
+            continue
+        if not passes_quality(image, places, confusers):
+            # A metadata rejection sticks. A thin search hit can still be replaced later.
+            if image.get("meta_blob") or image.get("full_width"):
+                rejected.add(key)
+                kept.pop(key, None)
+            continue
+        kept.setdefault(key, image)
+    chosen = list(kept.values())
+    quality = [image for image in chosen if image.get("score", 0) >= 2]
+    # Prefer featured/quality photos when there are enough for every page of this city.
+    if len(quality) >= max(6, int(min_count or 1)):
+        chosen = quality
+    chosen.sort(key=lambda image: (-int(image.get("score") or 0), image.get("file") or ""))
+    return _drop_near_duplicates(chosen)
+
+
+async def build_location_pool(info, extra_queries=None, timeout=6.0, min_count=6):
+    city = (info.get("city") or "").strip()
+    country = (info.get("country") or "").strip()
+    article = _ARTICLE_TITLES.get(city.casefold(), city) if city else ""
+    places = place_terms(city, country)
+    queries = [f"{article or city} skyline", f"{article or city} landmark", f"{article or city} old town"]
+    for theme in (info.get("themes") or [])[:2]:
+        word = _THEME_WORDS.get(theme)
+        if word:
+            queries.append(f"{article or city} {word}")
     for query in extra_queries or []:
         text = " ".join(str(query or "").split())
-        if text and text.casefold() not in seen_queries:
-            seen_queries.add(text.casefold())
+        if text:
             queries.append(text)
-    queries = [query for query in queries if query][:4]
-    city = (info.get("city") or "").strip()
-    images = []
-    seen = set()
-
-    def add(batch):
-        for image in batch or []:
-            key = image.get("file") or photo_file_key(image.get("src"))
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            image["file"] = key
-            images.append(image)
-
+    unique_queries = []
+    seen_queries = set()
+    for query in queries:
+        key = query.casefold()
+        if query and key not in seen_queries:
+            seen_queries.add(key)
+            unique_queries.append(query)
+    gathered = []
     try:
         async with wiki_client(timeout=max(float(timeout or 8), 8)) as http:
-            # Pictures shown on the city article, then a name-matched search if that set is short.
-            article = _ARTICLE_TITLES.get(city.casefold(), city) if city else ""
             if article:
-                add(await fetch_displayed_photos(http, article))
-            if len(images) < 8 and city and article.casefold() != city.casefold():
-                add(await fetch_displayed_photos(http, city))
-            if len(images) < 4 and article:
-                add(await fetch_article_photos(http, article))
-            if len(images) < 8:
-                for query in queries:
-                    if len(images) >= 12:
+                gathered.extend(await fetch_commons_photos(http, f"{article} filetype:bitmap"))
+            filenames = []
+            lead = ""
+            if article:
+                lead = await fetch_lead_filename(http, article) or ""
+                if lead:
+                    filenames.append(lead)
+            target = max(8, int(min_count or 1))
+            if len(_keep_quality(gathered, places, city, min_count=min_count)) < target:
+                # Landmark articles and Commons quality/featured sets, still one file page each.
+                if article:
+                    gathered.extend(await fetch_commons_photos(
+                        http, f"{article} skyline OR landmark filetype:bitmap",
+                    ))
+                    gathered.extend(await fetch_commons_photos(
+                        http, f"{article} filetype:bitmap incategory:\"Quality images\"",
+                    ))
+                for query in unique_queries[:4]:
+                    filenames.extend(await fetch_search_filenames(http, query))
+            if filenames:
+                enriched = await _imageinfo_files(http, filenames)
+                lead_key = unquote(lead).casefold()
+                if lead_key.startswith("file:"):
+                    lead_key = lead_key[5:]
+                for image in enriched:
+                    file_key = str(image.get("file") or "")
+                    title_key = str(image.get("title") or "").replace("_", " ").casefold()
+                    if lead_key and (file_key == lead_key or title_key == lead_key.replace("_", " ")):
+                        image["trusted"] = True
+                        image["score"] = max(int(image.get("score") or 0), 1)
                         break
-                    for image in await fetch_search_pool(http, query):
-                        blob = f"{image.get('title') or ''} {image.get('file') or ''}"
-                        if city and not mentions_place(blob, city):
-                            continue
-                        add([image])
+                gathered.extend(enriched)
     except Exception:
         log.warning("location image pool failed", exc_info=True)
-    images.sort(key=lambda image: image.get("file") or "")
-    return images
+    return _keep_quality(gathered, places, city, min_count=min_count)
 
 
 def _assignment_lock():
@@ -1873,7 +2224,7 @@ PAGE_TEMPLATE = """
   </div>
 </div>
 <footer>TripAssembler · Custom assemblies for real travel constraints · <a href="/sitemap.xml">Sitemap</a></footer>
-<!-- ta-enhanced -->
+<!-- ta-enhanced v2 -->
 </body>
 </html>
 """
@@ -2674,10 +3025,10 @@ def day_is_identifiable(title, city):
 
 
 def needs_image_lookup(document):
-    if ENHANCED_MARKER in document:
+    # Only the current marker is final. An older hero is replaced.
+    if ENHANCED_MARKER in (document or ""):
         return False
-    markers = ('class="hero-photo"', 'class="stop-thumb"', 'class="day-photo"')
-    return not any(marker in document for marker in markers)
+    return True
 
 
 def inject_hero(document, image, alt):
@@ -2843,13 +3194,16 @@ def strip_enhanced_media(document):
         document,
         flags=re.S,
     )
-    return document.replace(ENHANCED_MARKER, "")
+    document = document.replace(ENHANCED_MARKER, "")
+    document = document.replace("<!-- ta-enhanced -->", "")
+    return document
 
 
 async def enhance_document(slug, document):
     """Add photos, related trips, and the tagline. Raises if image lookup itself raises."""
     if ENHANCED_MARKER in document and 'id="related-trips"' in document:
         return apply_tagline(document)
+    document = strip_enhanced_media(document)
     document = apply_tagline(document)
     info = context_for(slug, document)
     if needs_image_lookup(document):

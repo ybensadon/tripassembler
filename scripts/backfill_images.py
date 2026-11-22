@@ -95,7 +95,9 @@ async def assign_distinct(infos):
         extra = []
         for info in group:
             extra.extend(app.pool_queries(info))
-        pool = await app.build_location_pool(group[0], extra_queries=extra, timeout=20.0)
+        pool = await app.build_location_pool(
+            group[0], extra_queries=extra, timeout=20.0, min_count=len(group),
+        )
         bucket = {"pool": pool, "assigned": {}}
         taken = set()
         for info in group:
@@ -123,7 +125,6 @@ async def enhance_distinct(pairs):
     await assign_distinct(infos)
     wrote = 0
     failed = 0
-    kept = 0
     for path, slug, original, document, info in prepared:
         try:
             updated = await app.enhance_document(slug, document)
@@ -131,17 +132,16 @@ async def enhance_distinct(pairs):
             failed += 1
             print(f"fail {slug}: {exc}", flush=True)
             continue
-        if 'class="hero-photo"' not in updated and 'class="hero-photo"' in original:
-            kept += 1
-            print(f"kept {slug} (new pass had no photo)", flush=True)
-            continue
+        if 'class="hero-photo"' not in updated:
+            failed += 1
+            print(f"no photo {slug}", flush=True)
         if updated != original:
             app.write_text_atomic(path, updated)
             wrote += 1
             print(f"updated {slug}", flush=True)
         else:
             print(f"unchanged {slug}", flush=True)
-    return 0, wrote, failed + kept
+    return 0, wrote, failed
 
 
 def hero_duplicate_report(directory):
